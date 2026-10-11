@@ -26,8 +26,7 @@ button.primary { background: var(--accent); color: #fff; border-color: var(--acc
 input, select, textarea { font: inherit; padding: 4px 6px; border: 1px solid var(--border); border-radius: 5px; background: #fff; }
 
 header { display: flex; gap: 12px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
-#doi-form { display: flex; gap: 6px; flex: 0 1 560px; }
-#doi { flex: 1; }
+#paper-title { flex: 0 1 560px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #status { flex: 1; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #status.error { color: #b3261e; }
 body.busy #status::before { content: "⏳ "; }
@@ -55,6 +54,7 @@ main > * { min-height: 0; min-width: 0; border-right: 1px solid var(--border); d
 .badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: #eee; text-transform: uppercase; letter-spacing: 0.03em; }
 .k-pdf { background: #fde2e1; } .k-tei { background: #e1ecfd; } .k-jats { background: #e3f6e3; }
 .k-docling { background: #f3e5fb; } .k-openalex { background: #fff4d6; }
+.k-zotero { background: #fde2e2; margin-left: 3px; }
 fieldset { border: 1px solid var(--border); border-radius: 6px; margin: 10px 0; }
 fieldset textarea { width: 100%; resize: vertical; margin-bottom: 6px; }
 #log { font-size: 11px; white-space: pre-wrap; color: var(--muted); max-height: 220px; overflow: auto; background: #fafaf8; padding: 6px; border-radius: 4px; }

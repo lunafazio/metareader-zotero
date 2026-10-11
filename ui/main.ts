@@ -11,11 +11,7 @@ const STRUCTURED: SourceKind[] = ["tei", "jats", "docling", "text", "other"];
 
 document.querySelector("#app")!.innerHTML = `
 <header>
-  <form id="doi-form">
-    <input id="doi" list="recent" placeholder="DOI, e.g. 10.1371/journal.pone.0000000" spellcheck="false" />
-    <datalist id="recent"></datalist>
-    <button type="submit">Load</button>
-  </form>
+  <span id="paper-title"></span>
   <span id="status"></span>
   <button id="view-btn" class="primary" disabled>Next: reproducibility →</button>
   <button id="settings-btn" title="Settings">⚙ Settings</button>
@@ -143,7 +139,6 @@ async function loadDoi(input: string) {
   const d = input.trim().replace(/^https?:\/\/(dx\.)?doi\.org\//i, "").replace(/^doi:/i, "");
   if (!d) return;
   doi = d;
-  $<HTMLInputElement>("#doi").value = d;
   models.clear();
   currentRef = "";
   currentPdf = "";
@@ -151,16 +146,17 @@ async function loadDoi(input: string) {
   kinds.clear();
   pdf.clear("Loading…");
   $("#log").textContent = "";
-  meta = await task("Fetching OpenAlex metadata", () => api.fetchOpenAlex(d));
+  // Items without a DOI are keyed "zotero:<item key>" and have no OpenAlex record.
+  meta = d.startsWith("zotero:") ? null : await task("Fetching OpenAlex metadata", () => api.fetchOpenAlex(d));
   await refreshFiles();
   if (!meta) {
     try { meta = JSON.parse(await api.readText(d, "openalex.json")); } catch { /* offline & never fetched */ }
   }
   document.title = `MetaReader — ${meta?.title ?? d}`;
+  $("#paper-title").textContent = meta?.title ?? (d.startsWith("zotero:") ? "" : d);
   if (!files.some((f) => kinds.get(f.name) === "pdf") || !files.some((f) => STRUCTURED.includes(kinds.get(f.name)!))) {
     await fetchFormats();
   } else render();
-  refreshRecent();
   restore = undefined;
   $<HTMLButtonElement>("#view-btn").disabled = false;
   if (view === "repro") await repro.open();
@@ -394,13 +390,14 @@ function renderFiles() {
     .map((f) => {
       const k = kinds.get(f.name)!;
       const usable = k !== "openalex";
+      const zotero = f.attachment ? `<span class="badge k-zotero" title="Zotero attachment of this item">Zotero</span>` : "";
       return `<li>
         ${usable ? `<input type="checkbox" value="${esc(f.name)}" title="Include in Claude reconciliation" />` : `<span class="cb-pad"></span>`}
         <span class="fname" title="${esc(f.name)}">${esc(f.name)}</span>
-        <span class="badge k-${k}">${k}</span>
+        <span class="badge k-${k}">${k}</span>${zotero}
         <span class="size">${(f.size / 1024).toFixed(0)} KB</span>
         ${k === "pdf" ? `<button data-act="pdf" data-name="${esc(f.name)}" title="Show in PDF pane">👁</button>` : STRUCTURED.includes(k) ? `<button data-act="ref" data-name="${esc(f.name)}" title="Use as reference text">👁</button>` : `<span class="cb-pad"></span>`}
-        ${k !== "openalex" ? `<button data-act="del" data-name="${esc(f.name)}" title="Delete">✕</button>` : ""}
+        ${k !== "openalex" && !f.attachment ? `<button data-act="del" data-name="${esc(f.name)}" title="Delete">✕</button>` : ""}
       </li>`;
     })
     .join("");
@@ -470,10 +467,6 @@ function switchTab(tab: string) {
 }
 document.querySelectorAll<HTMLButtonElement>(".tabs button").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab!)));
 
-$("#doi-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  loadDoi($<HTMLInputElement>("#doi").value);
-});
 $("#pdf-select").addEventListener("change", (e) => showPdf((e.target as HTMLSelectElement).value));
 $("#ref-select").addEventListener("change", (e) => showRef((e.target as HTMLSelectElement).value));
 $("#zoom-in").addEventListener("click", () => pdf.zoom(1.15));
@@ -497,11 +490,6 @@ dialog.addEventListener("close", async () => {
   status("Settings saved");
 });
 
-async function refreshRecent() {
-  const papers = await api.listPapers().catch(() => []);
-  $("#recent").innerHTML = papers.map((p) => `<option value="${esc(p.doi)}">${esc(p.title)}</option>`).join("");
-}
-refreshRecent();
 updateButtons();
 
 // ---------- reproducibility view ----------
@@ -542,14 +530,17 @@ window.addEventListener("beforeunload", () => {
   api.saveSession({ doi, ref: currentRef, pdf: currentPdf, tab: sidebarTab, view, reproStep: repro.currentStep });
 });
 
+// The plugin opens one tab per Zotero item and passes its DOI (or a zotero:<key> placeholder) in the URL;
+// the session (last reference text, PDF, view) is stored per item in its MetaReader Package.
 (async () => {
   const s = await api.loadSession().catch(() => null);
   try {
     if (s?.tab) switchTab(s.tab);
-    if (s?.doi) {
-      restore = { ref: s.ref, pdf: s.pdf };
-      await loadDoi(s.doi);
-      if (s.view === "repro") await setView("repro", s.reproStep);
+    const key = new URLSearchParams(location.search).get("doi");
+    if (key) {
+      restore = { ref: s?.ref, pdf: s?.pdf };
+      await loadDoi(key);
+      if (s?.view === "repro") await setView("repro", s.reproStep);
     }
   } finally {
     restoring = false;
