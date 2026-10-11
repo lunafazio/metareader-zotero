@@ -1,6 +1,8 @@
-// Helper prefix for zeval scripts: `call(method, ...args)` goes through the real UI→host bridge.
-const mw = Services.wm.getMostRecentWindow("metareader:main");
-const cw = mw.document.getElementById("ui").contentWindow;
+// Helper prefix for zeval scripts: `call(method, ...args)` goes through the real UI→plugin bridge of the
+// selected MetaReader tab.
+const mrTab = win.Zotero_Tabs._tabs.find((t) => t.type === "metareader");
+const mrBrowser = mrTab && win.document.getElementById(mrTab.id).querySelector("browser");
+const cw = mrBrowser?.contentWindow;
 let seq = 1e6;
 const call = (method, ...args) => new Promise((resolve, reject) => {
   const id = ++seq;

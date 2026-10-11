@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "name": "MetaReader",
+  "version": "0.1.0",
+  "description": "Read a paper's PDF next to its structured full text (TEI/JATS/Docling) with sentence-level highlighting, and build a computational-reproducibility package. Generated files are kept in a MetaReader Package attachment under the item.",
+  "author": "Luna Fazio",
+  "icons": { "16": "content/icons/package.svg" },
+  "applications": {
+    "zotero": {
+      "id": "metareader@lunafazio",
+      "update_url": "https://localhost/metareader-updates.json",
+      "strict_min_version": "7.0",
+      "strict_max_version": "10.*"
+    }
+  }
+}

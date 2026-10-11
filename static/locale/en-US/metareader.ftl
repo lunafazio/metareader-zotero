@@ -1,0 +1,10 @@
+metareader-open =
+    .label = Open in MetaReader
+metareader-pane-header =
+    .label = MetaReader Package
+metareader-pane-sidenav =
+    .tooltiptext = MetaReader Package
+metareader-pane-open =
+    .tooltiptext = Open in MetaReader
+metareader-pane-reveal =
+    .tooltiptext = Show package folder
