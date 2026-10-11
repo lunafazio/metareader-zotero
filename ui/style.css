@@ -209,6 +209,13 @@ button.danger-text { color: #b3261e; }
 .rp-gen-row { display: flex; gap: 8px; align-items: center; padding: 8px 0; border-top: 1px solid var(--border); }
 .rp-gen-row > div { flex: 1; }
 .rp-events { max-height: 320px; overflow: auto; }
+.rp-codegen { grid-template-columns: minmax(420px, 1fr) minmax(380px, 1fr); }
+.rp-gen-left, .rp-gen-right { display: flex; flex-direction: column; min-height: 0; }
+.rp-gen-left .rp-gen-row:first-of-type { border-top: 0; }
+.rp-log-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 6px; }
+.rp-log-head h4 { margin: 4px 0; }
+.rp-gen-left .rp-events { flex: 1; min-height: 120px; max-height: none; margin: 0; background: #fafaf8; border: 1px solid var(--border); border-radius: 5px; padding: 6px 6px 6px 22px; }
+.rp-gen-files { flex: 1; min-height: 0; overflow: auto; }
 
 /* ---------- reproducibility: dialogs ---------- */
 dialog.rp-dialog { width: min(1100px, 94vw); max-height: 92vh; }

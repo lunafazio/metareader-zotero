@@ -213,7 +213,8 @@ export class ReproView {
 
   private managePolling() {
     const s = this.state.step;
-    const need = (s === STEP.codegen && this.running.has("codegen")) || (s === STEP.run && this.running.has("run"));
+    // The code generation step watches the package folder (also for edits made in an external editor).
+    const need = s === STEP.codegen || (s === STEP.run && this.running.has("run"));
     if (need && !this.poll) this.poll = window.setInterval(() => this.pollStatus(), 2500);
     if (!need && this.poll) {
       clearInterval(this.poll);
@@ -800,28 +801,29 @@ export class ReproView {
     const st = this.state;
     const gen = this.running.has("codegen");
     body.innerHTML = `
-    <div class="rp-card">
-      <h3>Generate the code</h3>
-      ${!st.packaged ? `<p class="warn">Create the package in step 4 first.</p>` : ""}
-      <div class="rp-gen-row">
-        <div><b>Headless LLM agent</b><div class="hint">Runs without interaction in the package folder and implements the ${TODO_MARK} markers itself. Progress appears below; the result is committed to the package's git repository.</div></div>
-        <button id="rp-gen" class="primary" ${gen || !st.packaged ? "disabled" : ""}>${gen ? "Generating…" : "Run headless…"}</button>
-        <button id="rp-gen-stop" ${gen ? "" : "disabled"}>Stop</button>
-      </div>
-      <div class="rp-gen-row">
-        <div><b>Your own editor</b><div class="hint">Opens the package folder in your code editor (set in ⚙ Settings, otherwise the first one found). The suggested prompt tells an agent what to implement.</div></div>
-        <button id="rp-editor" ${st.packaged ? "" : "disabled"}>Open in external editor</button>
-        <button id="rp-copy-prompt" ${st.packaged ? "" : "disabled"}>Copy suggested prompt</button>
-      </div>
-      ${st.lastCodegen ? `<p class="muted">Last headless run: exit ${st.lastCodegen.code}, ${(st.lastCodegen.duration_ms / 1000).toFixed(0)} s, ${esc(new Date(st.lastCodegen.at).toLocaleString())}${st.lastCodegen.commit ? ` · <code>${esc(st.lastCodegen.commit)}</code>` : ""}</p>` : ""}
-    </div>
-    <div class="rp-card">
-      <div class="rp-editor-head"><h3>Folder status</h3><span class="spacer"></span><button id="rp-refresh">↻ Refresh</button></div>
-      <p id="rp-gen-summary" class="muted">Loading…</p>
-      <h4 id="rp-events-head" hidden>Agent activity</h4>
-      <ul id="rp-events" class="rp-events" hidden></ul>
-      <h4>Files (most recently modified first)</h4>
-      <div id="rp-gen-files"></div>
+    <div class="rp-cols rp-codegen">
+      <section class="rp-card rp-gen-left">
+        <h3>Generate the code</h3>
+        ${!st.packaged ? `<p class="warn">Create the package in step 4 first.</p>` : ""}
+        <div class="rp-gen-row">
+          <div><b>Your own editor</b><div class="hint">Opens the package folder in your code editor (set in ⚙ Settings, otherwise the first one found). The suggested prompt tells an agent what to implement.</div></div>
+          <button id="rp-editor" ${st.packaged ? "" : "disabled"}>Open in external editor</button>
+          <button id="rp-copy-prompt" ${st.packaged ? "" : "disabled"}>Copy suggested prompt</button>
+        </div>
+        <div class="rp-gen-row">
+          <div><b>Headless LLM agent</b><div class="hint">Runs without interaction in the package folder and implements the ${TODO_MARK} markers itself. Its activity appears below; changed files are committed to the package's git repository.</div></div>
+          <button id="rp-gen" class="primary" ${gen || !st.packaged ? "disabled" : ""}>${gen ? "Generating…" : "Run headless…"}</button>
+          <button id="rp-gen-stop" ${gen ? "" : "disabled"}>Stop</button>
+        </div>
+        <div class="rp-log-head"><h4>Agent activity</h4>${st.lastCodegen ? `<span class="muted">last run: exit ${st.lastCodegen.code}, ${(st.lastCodegen.duration_ms / 1000).toFixed(0)} s, ${esc(new Date(st.lastCodegen.at).toLocaleString())}${st.lastCodegen.commit ? ` · <code>${esc(st.lastCodegen.commit)}</code>` : ""}</span>` : ""}</div>
+        <p id="rp-events-empty" class="muted">No headless run yet.</p>
+        <ul id="rp-events" class="rp-events" hidden></ul>
+      </section>
+      <section class="rp-card rp-gen-right">
+        <div class="rp-editor-head"><h3>Package folder</h3><span class="muted" title="Refreshed every few seconds while this step is open">● watching</span><span class="spacer"></span><button id="rp-refresh">↻ Refresh</button></div>
+        <p id="rp-gen-summary" class="muted">Loading…</p>
+        <div id="rp-gen-files" class="rp-gen-files"></div>
+      </section>
     </div>`;
     body.querySelector("#rp-gen")!.addEventListener("click", () => this.generate());
     body.querySelector("#rp-gen-stop")!.addEventListener("click", () => api.stopTask("codegen"));
@@ -892,7 +894,7 @@ export class ReproView {
     const now = Date.now();
     const age = (t: number) => { const s = (now - t) / 1000; return s < 60 ? `${s.toFixed(0)} s ago` : s < 3600 ? `${(s / 60).toFixed(0)} min ago` : new Date(t).toLocaleString(); };
     const recent = [...this.files].sort((a, b) => b.modified - a.modified);
-    this.root.querySelector("#rp-gen-files")!.innerHTML = `<table class="rp-table"><tr><th>Path</th><th>Size</th><th>Modified</th></tr>${recent.map((f) => `<tr class="${now - f.modified < 60000 ? "fresh" : ""}"><td><code>${esc(f.path)}</code></td><td>${(f.size / 1024).toFixed(1)} KB</td><td>${age(f.modified)}</td></tr>`).join("")}</table>`;
+    this.root.querySelector("#rp-gen-files")!.innerHTML = `<table class="rp-table"><tr><th>Path <span class="muted">(most recently modified first)</span></th><th>Size</th><th>Modified</th></tr>${recent.map((f) => `<tr class="${now - f.modified < 60000 ? "fresh" : ""}"><td><code>${esc(f.path)}</code></td><td>${(f.size / 1024).toFixed(1)} KB</td><td>${age(f.modified)}</td></tr>`).join("")}</table>`;
   }
 
   /**
@@ -903,7 +905,7 @@ export class ReproView {
     const ul = this.root.querySelector<HTMLUListElement>("#rp-events");
     if (!ul) return;
     ul.hidden = !events.length;
-    this.root.querySelector<HTMLElement>("#rp-events-head")!.hidden = !events.length;
+    this.root.querySelector<HTMLElement>("#rp-events-empty")!.hidden = !!events.length;
     const atEnd = nearEnd(ul);
     if (events.length < ul.children.length) ul.replaceChildren(); // a new run replaced the log
     const fresh = ul.children.length === 0;
@@ -912,11 +914,14 @@ export class ReproView {
       li.textContent = text;
       ul.append(li);
     }
-    if (fresh) {
-      const keep = this.eventsKeep;
-      this.eventsKeep = undefined;
-      ul.scrollTop = !keep || keep.atEnd ? ul.scrollHeight : keep.top;
-    } else if (atEnd) ul.scrollTop = ul.scrollHeight;
+    const keep = fresh ? this.eventsKeep : undefined;
+    if (fresh) this.eventsKeep = undefined;
+    const follow = fresh ? !keep || keep.atEnd : atEnd;
+    if (follow) {
+      ul.scrollTop = ul.scrollHeight;
+      // Surrounding text can still change the list's height in this render; stay at the end after layout.
+      requestAnimationFrame(() => (ul.scrollTop = ul.scrollHeight));
+    } else if (keep) ul.scrollTop = keep.top;
   }
 
   private async codegenEvents(): Promise<string[]> {

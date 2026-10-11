@@ -34,9 +34,10 @@ Seven steps, state saved per item in the package (`repro/.metareader/state.json`
    the prompt before sending. Each call's extractions are grouped under it; changes are stored on top of the
    LLM's version (↺ Restore), rows can be unticked, and a whole call can be discarded after a confirmation.
 4. **Master script**: creating the package writes the files and commits them to a git repository in `repro/`.
-5. **Code generation**: a headless LLM agent (with a confirmation that shows the model call), or the package
-   folder opened in your code editor plus a suggested prompt to copy. A headless run that changes files is
-   committed.
+5. **Code generation**: on the left, the package folder opened in your code editor plus a suggested prompt to
+   copy, then the headless LLM agent (with a confirmation that shows the model call) and its activity log. On
+   the right, the package files, refreshed every few seconds while the step is open (also picks up edits made
+   in the editor). A headless run that changes files is committed.
 6. **Run & compare** and 7. **Report & package**.
 
 ## Layout
