@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Strip VS Code snap environment leakage (GTK/GIO/schema paths) before launching Zotero.
+for v in GSETTINGS_SCHEMA_DIR GTK_EXE_PREFIX GTK_PATH GDK_PIXBUF_MODULE_FILE GDK_PIXBUF_MODULEDIR GTK_IM_MODULE_FILE GIO_MODULE_DIR LOCPATH; do unset "$v"; done
+[ -n "$XDG_DATA_DIRS_VSCODE_SNAP_ORIG" ] && export XDG_DATA_DIRS="$XDG_DATA_DIRS_VSCODE_SNAP_ORIG"
+[ -n "$XDG_CONFIG_DIRS_VSCODE_SNAP_ORIG" ] && export XDG_CONFIG_DIRS="$XDG_CONFIG_DIRS_VSCODE_SNAP_ORIG"
+exec "$@"
