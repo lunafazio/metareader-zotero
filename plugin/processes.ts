@@ -17,11 +17,11 @@ const env = (name: string): string => Services.env.get(name) ?? "";
 export function searchPath(): string {
   const home = env("HOME");
   const dirs = env("PATH").split(":").filter(Boolean);
-  for (const d of [`${home}/.local/bin`, `${home}/bin`, "/usr/local/bin", "/usr/bin", "/bin"]) if (!dirs.includes(d)) dirs.push(d);
+  for (const d of [`${home}/.local/bin`, `${home}/bin`, "/usr/local/bin", "/usr/bin", "/bin", "/snap/bin"]) if (!dirs.includes(d)) dirs.push(d);
   return dirs.join(":");
 }
 
-async function which(cmd: string): Promise<string> {
+export async function which(cmd: string): Promise<string> {
   if (cmd.includes("/")) return cmd;
   try {
     return await Subprocess.pathSearch(cmd, { PATH: searchPath() });
@@ -36,6 +36,7 @@ export interface Spawn {
   log: string; // stdout (and stderr, unless errLog is set) go here
   errLog?: string;
   stdin?: string;
+  env?: Record<string, string>;
 }
 
 export async function runLogged(key: string, s: Spawn): Promise<RunResult> {
@@ -43,7 +44,7 @@ export async function runLogged(key: string, s: Spawn): Promise<RunResult> {
   await IOUtils.makeDirectory(PathUtils.parent(s.log), { ignoreExisting: true, createAncestors: true });
   const exe = await which(s.argv[0]);
   const redirect = s.errLog ? `>"$MR_LOG" 2>"$MR_ERR"` : `>"$MR_LOG" 2>&1`;
-  const environment: Record<string, string> = { PATH: searchPath(), MR_LOG: s.log };
+  const environment: Record<string, string> = { ...s.env, PATH: searchPath(), MR_LOG: s.log };
   if (s.errLog) environment.MR_ERR = s.errLog;
   const start = Date.now();
   const proc = await Subprocess.call({
@@ -77,4 +78,26 @@ export const runningTasks = (prefix: string) => [...running.keys()].filter((k) =
 
 export async function stopAll(prefix = "") {
   for (const k of [...running.keys()]) if (k.startsWith(prefix)) await stopTask(k);
+}
+
+/** Start a GUI program (e.g. a code editor) in its own session without waiting for it. */
+export async function spawnDetached(argv: string[], cwd: string) {
+  const exe = await which(argv[0]);
+  const proc = await Subprocess.call({
+    command: await which("setsid"),
+    arguments: [exe, ...argv.slice(1)],
+    workdir: cwd,
+    environment: { PATH: searchPath() },
+    environmentAppend: true,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  proc.stdin.close();
+  // Drain output in the background so a chatty program can't block on a full pipe.
+  (async () => {
+    while (await proc.stdout.readString()) { /* discard */ }
+  })().catch(() => {});
+  (async () => {
+    while (await proc.stderr.readString()) { /* discard */ }
+  })().catch(() => {});
 }

@@ -4,7 +4,7 @@
 // because the tab is already bound to its item.
 import { Config, loadConfig, saveConfig } from "./config";
 import { PACKAGE_FILE, listPackage, packageDir, updateOverview } from "./package";
-import { RunResult, runLogged, runningTasks, stopTask } from "./processes";
+import { RunResult, runLogged, runningTasks, spawnDetached, stopTask, which } from "./processes";
 
 export interface Paper {
   parent: any; // regular Zotero item
@@ -130,11 +130,28 @@ Rules:
 - Output ONLY the XML, starting with <?xml or <TEI and ending with </TEI>. No commentary, no code fences.
 {EXTRA}`;
 
-function claudeArgs(cfg: Config, ...args: string[]): string[] {
+/** Per-call options chosen in the UI's confirmation dialogs. */
+export interface LlmOptions {
+  model?: string; // undefined: use the configured default; "": the CLI's own default
+}
+
+function claudeArgs(cfg: Config, opts: LlmOptions | undefined, ...args: string[]): string[] {
   const argv = [cfg.claude_cmd, "-p", ...args];
-  if (cfg.claude_model.trim()) argv.push("--model", cfg.claude_model.trim());
+  const model = (opts?.model ?? cfg.claude_model).trim();
+  if (model) argv.push("--model", model);
   return argv;
 }
+
+const promptArgs = (cfg: Config, opts?: LlmOptions) => claudeArgs(cfg, opts, "--output-format", "text");
+
+function codegenArgs(cfg: Config, allowExec: boolean, opts?: LlmOptions) {
+  const tools = ["Read", "Write", "Edit", "Glob", "Grep"];
+  if (allowExec) tools.push("Bash(Rscript:*)", "Bash(R:*)", "Bash(python:*)", "Bash(python3:*)", "Bash(snakemake:*)", "Bash(pip:*)", "Bash(ls:*)");
+  return claudeArgs(cfg, opts, "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", tools.join(","));
+}
+
+/** Editors tried, in order, when no editor command is configured. */
+const EDITORS = ["code", "codium", "cursor", "zed", "subl", "xdg-open"];
 
 // ---------- api ----------
 
@@ -318,7 +335,7 @@ export function makeApi(paper: Paper) {
     const prompt = RECONCILE_PROMPT.replace("{FILES}", files).replace("{EXTRA}", extra);
     const log = PathUtils.join(dir, ".claude.out");
     const errLog = PathUtils.join(dir, ".claude.err");
-    const argv = claudeArgs(cfg, "--output-format", "text", "--allowedTools", "Read", ...[...addDirs].flatMap((d) => ["--add-dir", d]));
+    const argv = claudeArgs(cfg, undefined, "--output-format", "text", "--allowedTools", "Read", ...[...addDirs].flatMap((d) => ["--add-dir", d]));
     const r = await runLogged(task("reconcile"), { argv, cwd: dir, log, errLog, stdin: prompt });
     const stdout = await readText(log);
     if (r.code !== 0) throw new Error(`claude failed:\n${await readText(errLog)}\n${stdout}`);
@@ -342,21 +359,19 @@ export function makeApi(paper: Paper) {
   }
 
   /** One-shot Claude call returning the final text (used for JSON extraction tasks). */
-  async function claudePrompt(_doi: string, prompt: string): Promise<string> {
+  async function claudePrompt(_doi: string, prompt: string, opts?: LlmOptions): Promise<string> {
     const root = await reproRoot();
     const log = PathUtils.join(root, ".metareader", "claude-prompt.log");
-    const r = await runLogged(task("prompt"), { argv: claudeArgs(loadConfig(), "--output-format", "text"), cwd: root, log, stdin: prompt });
+    const r = await runLogged(task("prompt"), { argv: promptArgs(loadConfig(), opts), cwd: root, log, stdin: prompt });
     const out = await readText(log);
     if (r.code !== 0) throw new Error(`claude exited with ${r.code}:\n${out.slice(0, 3000)}`);
     return out;
   }
 
   /** Headless agentic code generation inside the repro folder; progress is streamed as JSONL to .metareader/codegen.jsonl. */
-  async function claudeCodegen(_doi: string, prompt: string, allowExec: boolean): Promise<RunResult> {
+  async function claudeCodegen(_doi: string, prompt: string, allowExec: boolean, opts?: LlmOptions): Promise<RunResult> {
     const root = await reproRoot();
-    const tools = ["Read", "Write", "Edit", "Glob", "Grep"];
-    if (allowExec) tools.push("Bash(Rscript:*)", "Bash(R:*)", "Bash(python:*)", "Bash(python3:*)", "Bash(snakemake:*)", "Bash(pip:*)", "Bash(ls:*)");
-    const argv = claudeArgs(loadConfig(), "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", tools.join(","));
+    const argv = codegenArgs(loadConfig(), allowExec, opts);
     const r = await runLogged(task("codegen"), { argv, cwd: root, log: PathUtils.join(root, ".metareader", "codegen.jsonl"), stdin: prompt });
     r.log = ".metareader/codegen.jsonl";
     return r;
@@ -380,6 +395,97 @@ export function makeApi(paper: Paper) {
       zw.close();
     }
     return zipPath;
+  }
+
+  /** The exact command line and folder an LLM call would use (shown before sending). */
+  async function llmCommand(_doi: string, kind: "prompt" | "codegen", opts?: LlmOptions & { allowExec?: boolean }) {
+    const cfg = loadConfig();
+    const argv = kind === "prompt" ? promptArgs(cfg, opts) : codegenArgs(cfg, !!opts?.allowExec, opts);
+    return { argv, cwd: await reproRoot(), defaultModel: cfg.claude_model };
+  }
+
+  /** Unpack an uploaded zip into a new folder below the repro root; returns the folder and the extracted files. */
+  async function reproUnzip(_doi: string, name: string, data: Uint8Array, parentDir: string) {
+    const root = await reproRoot();
+    const stem = safeName(name).replace(/\.zip$/i, "") || "archive";
+    let rel = `${parentDir}/${stem}`;
+    for (let i = 2; await IOUtils.exists(relPath(root, rel)); i++) rel = `${parentDir}/${stem}-${i}`;
+    const dest = await mkdir(relPath(root, rel));
+    const tmpDir = await mkdir(PathUtils.join(PathUtils.tempDir, `metareader-${Zotero.Utilities.randomString()}`));
+    const tmp = PathUtils.join(tmpDir, "upload.zip");
+    const Ci = Components.interfaces;
+    const zr = Components.classes["@mozilla.org/libjar/zip-reader;1"].createInstance(Ci.nsIZipReader);
+    const files: string[] = [];
+    try {
+      await IOUtils.write(tmp, data);
+      zr.open(Zotero.File.pathToFile(tmp));
+      const entries = zr.findEntries(null);
+      while (entries.hasMore()) {
+        const entry: string = entries.getNext();
+        if (entry.endsWith("/")) continue;
+        const parts = entry.split("/").filter((p) => p && p !== ".");
+        // Skip macOS metadata; reject anything that would escape the destination (zip slip).
+        if (parts[0] === "__MACOSX" || parts[parts.length - 1] === ".DS_Store") continue;
+        if (!parts.length || parts.some((p) => p === ".." || p.includes("\\"))) throw new Error(`unsafe path in zip: ${entry}`);
+        const out = PathUtils.join(dest, ...parts);
+        await mkdir(PathUtils.parent(out));
+        zr.extract(entry, Zotero.File.pathToFile(out));
+        files.push(`${rel}/${parts.join("/")}`);
+      }
+    } catch (e) {
+      await IOUtils.remove(dest, { recursive: true, ignoreAbsent: true });
+      throw e;
+    } finally {
+      try {
+        zr.close();
+      } catch { /* not opened */ }
+      await IOUtils.remove(tmpDir, { recursive: true, ignoreAbsent: true });
+    }
+    return { dir: rel, files: files.sort() };
+  }
+
+  /** Initialize the repro folder as a git repository (once) and commit its current state, if anything changed. */
+  async function reproGit(_doi: string, message: string) {
+    const root = await reproRoot();
+    const ignore = PathUtils.join(root, ".gitignore");
+    if (!(await IOUtils.exists(ignore))) {
+      await IOUtils.writeUTF8(ignore, ".metareader/\n.snakemake/\n_targets/\n__pycache__/\n.Rhistory\noutputs/.steps/\n");
+    }
+    const script = [
+      "set -e",
+      "[ -d .git ] || git init -q",
+      // Use a local identity only if none is configured globally.
+      'git config user.name >/dev/null || git config user.name "MetaReader"',
+      'git config user.email >/dev/null || git config user.email "metareader@localhost"',
+      "git add -A",
+      'if git diff --cached --quiet; then echo "nothing to commit"; else git commit -q -m "$MR_MSG"; fi',
+      "git log --oneline -1",
+    ].join("\n");
+    const log = PathUtils.join(root, ".metareader", "git.log");
+    const r = await runLogged(task("git"), { argv: ["bash", "-c", script], cwd: root, log, env: { MR_MSG: message } });
+    const out = (await readText(log)).trim();
+    if (r.code !== 0) throw new Error(`git failed:\n${out}`);
+    return { committed: !out.includes("nothing to commit"), head: out.split("\n").pop() ?? "" };
+  }
+
+  /** Open the repro folder in the configured (or first available) code editor. */
+  async function openInEditor() {
+    const root = await reproRoot();
+    const cfg = loadConfig();
+    let cmd = cfg.editor_cmd.trim();
+    if (!cmd) {
+      for (const c of EDITORS) {
+        try {
+          await which(c);
+          cmd = c;
+          break;
+        } catch { /* try next */ }
+      }
+    }
+    if (!cmd) throw new Error("No code editor found; set one in Settings.");
+    const argv = cmd.split(/\s+/);
+    await spawnDetached([...argv, root], root);
+    return argv[0];
   }
 
   async function reproList(_doi: string, hash = false) {
@@ -430,6 +536,10 @@ export function makeApi(paper: Paper) {
     runningTasks: async () => runningTasks(task("")),
     claudePrompt,
     claudeCodegen: changes(claudeCodegen),
+    llmCommand,
+    reproUnzip: changes(reproUnzip),
+    reproGit,
+    openInEditor,
     reproZip: changes(reproZip),
     loadSession: async () => {
       try {

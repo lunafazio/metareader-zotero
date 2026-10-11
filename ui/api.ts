@@ -9,12 +9,16 @@ export interface Config {
   docling_cmd: string;
   claude_cmd: string;
   claude_model: string;
+  editor_cmd: string;
 }
 export interface FileInfo { name: string; size: number; attachment?: boolean }
 export interface PaperInfo { doi: string; title: string }
 
 export interface ReproFile { path: string; size: number; modified: number; sha256: string | null }
 export interface RunResult { code: number | null; duration_ms: number; log: string }
+/** Per-call LLM options; model undefined = configured default, "" = the CLI's own default. */
+export interface LlmOptions { model?: string }
+export interface LlmCommand { argv: string[]; cwd: string; defaultModel: string }
 
 const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
 let seq = 0;
@@ -63,8 +67,13 @@ export const api = {
   reproRun: (doi: string, command: string) => call<RunResult>("reproRun", doi, command),
   stopTask: (key: string) => call<boolean>("stopTask", key),
   runningTasks: () => call<string[]>("runningTasks"),
-  claudePrompt: (doi: string, prompt: string) => call<string>("claudePrompt", doi, prompt),
-  claudeCodegen: (doi: string, prompt: string, allowExec: boolean) => call<RunResult>("claudeCodegen", doi, prompt, allowExec),
+  claudePrompt: (doi: string, prompt: string, opts?: LlmOptions) => call<string>("claudePrompt", doi, prompt, opts),
+  claudeCodegen: (doi: string, prompt: string, allowExec: boolean, opts?: LlmOptions) => call<RunResult>("claudeCodegen", doi, prompt, allowExec, opts),
+  llmCommand: (doi: string, kind: "prompt" | "codegen", opts?: LlmOptions & { allowExec?: boolean }) => call<LlmCommand>("llmCommand", doi, kind, opts),
+  reproUnzip: async (doi: string, file: File, parentDir: string) =>
+    call<{ dir: string; files: string[] }>("reproUnzip", doi, file.name, new Uint8Array(await file.arrayBuffer()), parentDir),
+  reproGit: (doi: string, message: string) => call<{ committed: boolean; head: string }>("reproGit", doi, message),
+  openInEditor: (doi: string) => call<string>("openInEditor", doi),
   reproZip: (doi: string) => call<string>("reproZip", doi),
   loadSession: () => call<any>("loadSession"),
   saveSession: (session: unknown) => call<void>("saveSession", session),

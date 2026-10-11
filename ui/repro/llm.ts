@@ -1,5 +1,6 @@
 import type { Block, DocModel, Sentence } from "../model";
-import type { AnalysisPlan, PlanStep, ResultsSchema, TargetResult } from "./schemas";
+import type { ResultsSchema, TargetResult } from "./schemas";
+import type { StepDraft } from "./state";
 import { decimalsOf, parseNum } from "./compare";
 
 /** Extract the first JSON object/array from LLM output (tolerates prose and code fences). */
@@ -120,12 +121,16 @@ export function figureTargets(model: DocModel, figureIds: string[], startIndex: 
     }));
 }
 
-export function planPrompt(model: DocModel, sentenceIds: string[], dataFiles: string[], codeFiles: string[], schema?: ResultsSchema): string {
-  const results = schema?.results.map((r) => `${r.id} (${r.type}): ${r.description}`).join("\n") ?? "(none defined yet)";
+export interface PromptInput { path: string; note: string }
+
+export function planPrompt(model: DocModel, sentenceIds: string[], data: PromptInput[], code: PromptInput[], schema?: ResultsSchema): string {
+  const results = schema?.results.map((r) => `${r.id} (${r.type}): ${r.description}`).join("\n") || "(none defined yet)";
+  const list = (xs: PromptInput[]) => xs.map((x) => `- ${x.path}${x.note ? ` — ${x.note}` : ""}`).join("\n");
   return `Turn the following excerpts of a scholarly paper's methods into an ordered ANALYSIS PLAN for a computational reproduction.
 
-Available data files (package-relative): ${dataFiles.join(", ") || "(none)"}
-${codeFiles.length ? `Original code files provided: ${codeFiles.join(", ")}\n` : ""}
+Available data files (package-relative):
+${list(data) || "(none)"}
+${code.length ? `Original code files provided:\n${list(code)}\n` : ""}
 Reproduction targets:
 ${results}
 
@@ -137,7 +142,7 @@ Return ONLY JSON: {"steps": [ ... ]} with each step:
   "quote": "<verbatim text from the excerpts this step implements>",
   "source_ids": ["<sentence ids>"],
   "inputs": ["<data files used directly, if any>"],
-  "depends_on": ["<keys of earlier steps, or data file paths>"],
+  "depends_on": ["<keys of earlier steps>"],
   "produces": ["<result ids from the target list computed by this step>"]
 }
 
@@ -148,53 +153,29 @@ EXCERPTS:${sentenceListing(model, sentenceIds)}
 `;
 }
 
-/** Wrap LLM steps with mandatory load-first / results-last steps and assign S-ids. */
-export function toPlan(raw: any, dataFiles: string[], schema?: ResultsSchema): AnalysisPlan {
+/** Normalize model output into plan step drafts with fresh ids (S<start>…); load and results steps are added later. */
+export function toStepDrafts(raw: any, dataFiles: string[], start: number): StepDraft[] {
   const items: any[] = Array.isArray(raw) ? raw : raw?.steps ?? [];
-  let n = 0;
-  const nextId = () => `S${String(++n).padStart(2, "0")}`;
-  const loads: PlanStep[] = dataFiles.map((f) => ({
-    id: nextId(), kind: "load", summary: `Load ${f}`, quote: "", source_ids: [], inputs: [f], depends_on: [], produces: [],
-  }));
+  const files = new Set(dataFiles);
   const keyToId = new Map<string, string>();
-  const fileToLoad = new Map(loads.map((l) => [l.inputs[0], l.id]));
-  const mid: PlanStep[] = items.map((s, i) => {
-    const id = nextId();
+  const ids = items.map((s, i) => {
+    const id = `S${String(start + i).padStart(2, "0")}`;
     keyToId.set(String(s.key ?? `A${i + 1}`), id);
+    return id;
+  });
+  return items.map((s, i): StepDraft => {
+    const strs = (x: unknown) => (Array.isArray(x) ? x.map(String) : []);
+    const deps = strs(s.depends_on);
     return {
-      id,
+      id: ids[i],
       kind: s.kind === "transform" ? "transform" : "analysis",
       summary: String(s.summary ?? ""),
       quote: String(s.quote ?? ""),
-      source_ids: Array.isArray(s.source_ids) ? s.source_ids.map(String) : [],
-      inputs: (Array.isArray(s.inputs) ? s.inputs.map(String) : []).filter((f: string) => fileToLoad.has(f)),
-      depends_on: Array.isArray(s.depends_on) ? s.depends_on.map(String) : [],
-      produces: Array.isArray(s.produces) ? s.produces.map(String) : [],
+      source_ids: strs(s.source_ids),
+      // Data files named as dependencies are inputs; load steps are generated from the inputs.
+      inputs: [...new Set([...strs(s.inputs), ...deps].filter((f) => files.has(f)))],
+      depends_on: deps.map((d) => keyToId.get(d)).filter((d): d is string => !!d && d !== ids[i]),
+      produces: strs(s.produces),
     };
   });
-  const known = new Set(schema?.results.map((r) => r.id) ?? []);
-  mid.forEach((s, i) => {
-    const deps = new Set<string>();
-    for (const d of s.depends_on) {
-      const id = keyToId.get(d) ?? fileToLoad.get(d);
-      if (id && id !== s.id) deps.add(id);
-    }
-    for (const f of s.inputs) deps.add(fileToLoad.get(f)!);
-    if (!deps.size) (i === 0 ? loads.map((l) => l.id) : [mid[i - 1].id]).forEach((d) => deps.add(d));
-    s.depends_on = [...deps];
-    s.produces = s.produces.filter((r) => known.has(r));
-  });
-  const used = new Set(mid.flatMap((s) => s.depends_on));
-  const sinks = mid.filter((s) => !used.has(s.id)).map((s) => s.id);
-  const results: PlanStep = {
-    id: nextId(),
-    kind: "results",
-    summary: "Collect all reproduced results and write outputs/results.json (format: schemas/results_output.schema.json); save figures to outputs/figures/<result id>.png",
-    quote: "",
-    source_ids: [],
-    inputs: [],
-    depends_on: sinks.length ? sinks : loads.map((l) => l.id),
-    produces: [...known],
-  };
-  return { schema_version: "1.0", steps: [...loads, ...mid, results] };
 }

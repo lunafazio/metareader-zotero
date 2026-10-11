@@ -5,10 +5,11 @@ export interface Config {
   docling_cmd: string;
   claude_cmd: string;
   claude_model: string;
+  editor_cmd: string;
 }
 
 const PREF = "extensions.metareader.";
-export const CONFIG_KEYS = ["openalex_api_key", "mailto", "grobid_url", "docling_cmd", "claude_cmd", "claude_model"] as const;
+export const CONFIG_KEYS = ["openalex_api_key", "mailto", "grobid_url", "docling_cmd", "claude_cmd", "claude_model", "editor_cmd"] as const;
 const DEFAULTS: Partial<Config> = { grobid_url: "http://localhost:8070", docling_cmd: "docling", claude_cmd: "claude" };
 
 export function loadConfig(): Config {

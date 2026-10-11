@@ -1,5 +1,6 @@
 import { CompareRow, CompareSettings, STATUS_LABEL, Status } from "./compare";
 import type { AnalysisPlan, ResultsSchema } from "./schemas";
+import type { InputMeta } from "./state";
 import { TEMPLATES, TemplateId } from "./templates";
 
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -16,6 +17,7 @@ export interface ReportInput {
   rows: CompareRow[];
   settings: CompareSettings;
   files: ReportFile[];
+  inputs: InputMeta[];
   template: TemplateId;
   command: string;
   run?: { code: number | null; duration_ms: number; at: string };
@@ -35,7 +37,7 @@ export function provenanceSvg(plan: AnalysisPlan, rows: CompareRow[]): string {
   const nodes = new Map<string, N>();
   const edges: [string, string][] = [];
   const files = [...new Set(plan.steps.flatMap((s) => s.inputs))];
-  files.forEach((f) => nodes.set("f:" + f, { id: "f:" + f, label: f.replace(/^data\//, ""), title: f, layer: 0, color: STATUS_COLOR.data }));
+  files.forEach((f) => nodes.set("f:" + f, { id: "f:" + f, label: f.replace(/^inputs\//, ""), title: f, layer: 0, color: STATUS_COLOR.data }));
   const layerOf = new Map<string, number>();
   for (const s of plan.steps) {
     const l = Math.max(0, ...s.depends_on.map((d) => layerOf.get(d) ?? 0), ...(s.inputs.length ? [0] : [])) + 1;
@@ -98,9 +100,14 @@ export function buildReport(r: ReportInput): string {
   const counts = r.rows.reduce<Record<string, number>>((m, x) => ((m[x.status] = (m[x.status] ?? 0) + 1), m), {});
   const numeric = r.rows.filter((x) => x.target.type !== "figure");
   const reproduced = numeric.filter((x) => x.status === "match" || x.status === "within").length;
-  const data = r.files.filter((f) => f.path.startsWith("data/"));
-  const code = r.files.filter((f) => f.path.startsWith("code/"));
-  const fileRows = (fs: ReportFile[]) => fs.map((f) => `<tr><td><code>${esc(f.path)}</code></td><td>${(f.size / 1024).toFixed(1)} KB</td><td><code class="hash">${esc(f.sha256 ?? "")}</code></td></tr>`).join("") || `<tr><td colspan="3">none</td></tr>`;
+  const byPath = new Map(r.files.map((f) => [f.path, f]));
+  const inputRows = (xs: InputMeta[]) =>
+    xs.map((i) => {
+      const f = byPath.get(i.path);
+      return `<tr><td><code>${esc(i.path)}</code></td><td>${i.role}</td><td>${esc(i.note)}</td><td>${f ? (f.size / 1024).toFixed(1) + " KB" : ""}</td><td><code class="hash">${esc(f?.sha256 ?? "")}</code></td></tr>`;
+    }).join("") || `<tr><td colspan="5">none</td></tr>`;
+  const usedInputs = r.inputs.filter((i) => !i.excluded);
+  const excluded = r.inputs.filter((i) => i.excluded);
 
   const resultRows = r.rows
     .map((x) => {
@@ -149,9 +156,9 @@ ${r.validation.warnings.length ? `<details><summary>${r.validation.warnings.leng
 <p class="legend"><span style="background:${STATUS_COLOR.data}">data</span><span style="background:${STATUS_COLOR.step}">step</span>${(["match", "within", "deviation", "missing", "figure"] as Status[]).map((s) => `<span style="background:${STATUS_COLOR[s]}">${s}</span>`).join("")}</p>
 <div class="dagwrap">${provenanceSvg(r.plan, r.rows)}</div>
 
-<h2>Input data</h2>
-<table><tr><th>File</th><th>Size</th><th>SHA-256</th></tr>${fileRows(data)}</table>
-${code.length ? `<h3>Original code</h3><table><tr><th>File</th><th>Size</th><th>SHA-256</th></tr>${fileRows(code)}</table>` : ""}
+<h2>Input files</h2>
+<table><tr><th>File</th><th>Role</th><th>Note</th><th>Size</th><th>SHA-256</th></tr>${inputRows(usedInputs)}</table>
+${excluded.length ? `<h3>Excluded archive members</h3><p>Unpacked from uploaded archives but not used.</p><table><tr><th>File</th><th>Role</th><th>Note</th><th>Size</th><th>SHA-256</th></tr>${inputRows(excluded)}</table>` : ""}
 
 <h2>Analysis plan</h2>
 <table><tr><th>Step</th><th>Kind</th><th>Summary &amp; source quote</th><th>Depends on</th><th>Produces</th></tr>
@@ -162,7 +169,7 @@ ${r.plan.steps.map((s) => `<tr><td><b>${s.id}</b></td><td>${s.kind}</td><td>${es
 ${r.schema.results.map((t) => `<tr><td><b>${t.id}</b></td><td>${t.type}</td><td>${esc(t.description)}<div class="quote">“${esc(trunc(t.quote, 300))}”</div></td><td>${t.comparator && t.comparator !== "=" ? esc(t.comparator) + " " : ""}${expectedCell(t.expected)}${t.unit ? " " + esc(t.unit) : ""}${t.decimals !== undefined ? ` <small>(${t.decimals} dp)</small>` : ""}</td><td>${esc(t.source_label ?? "")}</td></tr>`).join("")}</table>
 
 <h2>Package structure</h2>
-<p>The package is self-contained: <code>data/</code> holds inputs, <code>${esc(TEMPLATES[r.template].script)}</code> is the ${esc(TEMPLATES[r.template].label.toLowerCase())}, <code>analysis_plan.json</code> and <code>results_schema.json</code> describe steps and targets (JSON Schemas in <code>schemas/</code>), and <code>outputs/results.json</code> holds the reproduced values. Re-run with <code>${esc(r.command)}</code>.</p>
+<p>The package is self-contained: <code>inputs/</code> holds the input files (described in <code>inputs.json</code>), <code>${esc(TEMPLATES[r.template].script)}</code> is the ${esc(TEMPLATES[r.template].label.toLowerCase())}, <code>analysis_plan.json</code> and <code>results_schema.json</code> describe steps and targets (JSON Schemas in <code>schemas/</code>), and <code>outputs/results.json</code> holds the reproduced values. Re-run with <code>${esc(r.command)}</code>.</p>
 <pre>${esc(tree(r.files))}</pre>
 </body></html>`;
 }

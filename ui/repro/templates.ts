@@ -1,4 +1,5 @@
 import type { AnalysisPlan, PlanStep, ResultsSchema } from "./schemas";
+import type { InputMeta } from "./state";
 
 export type TemplateId = "r" | "targets" | "python" | "snakemake";
 
@@ -91,8 +92,11 @@ export function masterScript(t: TemplateId, plan: AnalysisPlan, schema: ResultsS
   return `${head}rule all:\n    input: "outputs/results.json"\n\n${rules}`;
 }
 
-export function agentPrompt(t: TemplateId, opts: { folder: string; hasCode: boolean; dataFiles: string[] }): string {
+export function agentPrompt(t: TemplateId, opts: { folder: string; inputs: InputMeta[] }): string {
   const tpl = TEMPLATES[t];
+  const used = opts.inputs.filter((i) => !i.excluded);
+  const list = (role: string) => used.filter((i) => i.role === role).map((i) => `  - ${i.path}${i.note ? ` — ${i.note}` : ""}`).join("\n");
+  const data = list("data"), code = list("code"), other = list("other");
   const specific: Record<TemplateId, string> = {
     r: `Implement each step section of analysis.R in place, in order.`,
     python: `Implement each step section of analysis.py in place, in order.`,
@@ -109,7 +113,8 @@ Read first:
 - analysis_plan.json — the same steps as structured data (ids, inputs, dependencies, result ids each step produces).
 - results_schema.json — the reproduction targets (ids, descriptions, quotes, expected values).
 - schemas/results_output.schema.json — the required format of outputs/results.json.
-- data/ — input data (${opts.dataFiles.length ? opts.dataFiles.join(", ") : "none uploaded"}). Never modify these files.${opts.hasCode ? "\n- code/ — the original authors' code. Prefer reusing their logic; cite the file you took it from in a comment." : ""}
+- inputs.json — the input files under inputs/ with their role (data / code / other), notes, and whether they are used. Never modify files in inputs/, and ignore files marked "used": false.
+- Data files:\n${data || "  (none)"}${code ? `\n- The original authors' code (prefer reusing their logic; cite the file you took it from in a comment):\n${code}` : ""}${other ? `\n- Other material:\n${other}` : ""}
 
 Rules:
 1. ${specific[t]}
@@ -135,8 +140,8 @@ DOI: ${doi}
 | \`analysis_plan.json\` | Analysis steps with verbatim source quotes |
 | \`results_schema.json\` | Reproduction targets with expected values |
 | \`schemas/\` | JSON Schemas for the files above and for outputs/results.json |
-| \`data/\` | Input data |
-| \`code/\` | Original code provided by the authors (if any) |
+| \`inputs/\` | Input files: data, the authors' original code, other material |
+| \`inputs.json\` | Role (data / code / other), notes and use of each input file |
 | \`targets/figures/\` | Crops of the original figures |
 | \`outputs/\` | Reproduced results (\`results.json\`), figures, run log |
 | \`report.html\` | Reproduction report |

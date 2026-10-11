@@ -67,6 +67,7 @@ document.querySelector("#app")!.innerHTML = `
     <label>Docling command <input name="docling_cmd" /></label>
     <label>Claude CLI command <input name="claude_cmd" /></label>
     <label>Claude model (optional) <input name="claude_model" placeholder="default" /></label>
+    <label>Code editor command (optional) <input name="editor_cmd" placeholder="auto: code, codium, cursor, zed, subl, xdg-open" /></label>
     <menu><button value="cancel">Cancel</button><button value="save" class="primary">Save</button></menu>
   </form>
 </dialog>`;
@@ -484,7 +485,7 @@ dialog.addEventListener("close", async () => {
   if (dialog.returnValue !== "save") return;
   const form = dialog.querySelector("form")!;
   const cfg = Object.fromEntries(
-    ["openalex_api_key", "mailto", "grobid_url", "docling_cmd", "claude_cmd", "claude_model"].map((k) => [k, (form.elements.namedItem(k) as HTMLInputElement).value.trim()]),
+    ["openalex_api_key", "mailto", "grobid_url", "docling_cmd", "claude_cmd", "claude_model", "editor_cmd"].map((k) => [k, (form.elements.namedItem(k) as HTMLInputElement).value.trim()]),
   ) as unknown as Config;
   await api.setConfig(cfg);
   status("Settings saved");

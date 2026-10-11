@@ -1,20 +1,26 @@
 import { api, ReproFile, RunResult } from "../api";
 import type { DocModel } from "../model";
 import type { PdfView } from "../pdfview";
-import { compareAll, CompareRow, CompareSettings, STATUS_LABEL } from "./compare";
-import { extractJson, figureTargets, indexDoc, planPrompt, resultsPrompt, toPlan, toTargets } from "./llm";
+import { compareAll, CompareRow, STATUS_LABEL } from "./compare";
+import {
+  addStepDialog, addTargetDialog, agentDialog, callDetailsDialog, confirmDialog, esc, llmDialog, LlmChoice, modal, PLAN_PRESETS,
+  scannedCounts, TARGET_PRESETS, trunc,
+} from "./dialogs";
+import { extractJson, figureTargets, indexDoc, planPrompt, resultsPrompt, toStepDrafts, toTargets } from "./llm";
 import { buildReport } from "./report";
 import {
-  AnalysisPlan, COMPARATORS, PLAN_JSON_SCHEMA, PlanStep, ReproducedOutput, RESULTS_OUTPUT_JSON_SCHEMA, RESULTS_SCHEMA_JSON_SCHEMA,
+  AnalysisPlan, COMPARATORS, PLAN_JSON_SCHEMA, ReproducedOutput, RESULTS_OUTPUT_JSON_SCHEMA, RESULTS_SCHEMA_JSON_SCHEMA,
   ResultsSchema, TargetResult, validateOutput, validatePlan, validateResultsSchema,
 } from "./schemas";
+import {
+  allEntries, buildPlan, buildSchema, Entry, findEntry, InputMeta, inputsManifest, isModified, Item, LlmCall, LlmGroup, loadState,
+  move, nextNumber, ReproState, restore, roleFor, ROLES, Role, setField, StepDraft, uid, usedInputs, value,
+} from "./state";
 import { agentPrompt, masterScript, packageReadme, TEMPLATES, TemplateId, TODO_MARK } from "./templates";
-import { SelectionTree } from "./tree";
 
-const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-const trunc = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 const STATE_FILE = ".metareader/state.json";
-const STEPS = ["Targets & inputs", "Analysis plan", "Master script", "Code generation", "Run & compare", "Report & package"];
+const STEPS = ["Inputs", "Targets", "Analysis plan", "Master script", "Code generation", "Run & compare", "Report & package"];
+const STEP = { inputs: 0, targets: 1, plan: 2, script: 3, codegen: 4, run: 5, report: 6 };
 
 export interface ReaderContext {
   doi(): string;
@@ -25,38 +31,29 @@ export interface ReaderContext {
   status(msg: string, kind?: "info" | "error"): void;
 }
 
-interface ReproState {
-  version: 1;
-  step: number;
-  source: string; // reference document the selections refer to
-  targetSel: string[];
-  planSel: string[];
-  schema?: ResultsSchema;
-  plan?: AnalysisPlan;
-  template: TemplateId;
-  script: string;
-  scriptDirty: boolean;
-  packaged?: { template: TemplateId; at: string };
-  command: string;
-  allowExec: boolean;
-  lastRun?: { code: number | null; duration_ms: number; at: string };
-  lastCodegen?: { code: number | null; duration_ms: number; at: string };
-  compare: CompareSettings;
-  reportPath?: string;
-  zipPath?: string;
+/** How one entry table (targets or plan steps) renders and parses its columns. */
+interface TableSpec<T extends { id: string }> {
+  key: "targets" | "steps";
+  noun: string;
+  items(): Item<T>[];
+  head: string[];
+  cells(v: T, disabled: boolean): string[];
+  parse(field: string, raw: string, v: T): unknown;
+  empty: string;
+  top?: string;
+  bottom?: string;
 }
 
-const freshState = (): ReproState => ({
-  version: 1, step: 0, source: "", targetSel: [], planSel: [], template: "r", script: "", scriptDirty: false,
-  command: "", allowExec: true, compare: { rounding: "reported", threshold: 5 },
-});
+const sizeText = (n: number) => (n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`);
+const nearEnd = (el: Element) => el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+const list = (s: string) => s.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
+const modelOf = (argv: string[]) => (argv.includes("--model") ? argv[argv.indexOf("--model") + 1] : "");
 
 export class ReproView {
   private doi = "";
-  private state = freshState();
+  private state: ReproState = loadState(null);
   private files: ReproFile[] = [];
   private folder = "";
-  private tree?: SelectionTree;
   private running = new Set<string>();
   private poll?: number;
   private output?: ReproducedOutput;
@@ -64,8 +61,9 @@ export class ReproView {
   private rows?: CompareRow[];
   private blobUrls: string[] = [];
   private saveTimer?: number;
-  /** Re-renders only the side panel of tree steps, so the tree keeps its expand state. */
-  private side?: () => void;
+  private renderedStep = -1;
+  /** Scroll position of the agent activity list across re-renders. */
+  private eventsKeep?: { top: number; atEnd: boolean };
 
   constructor(private root: HTMLElement, private ctx: ReaderContext) {
     root.innerHTML = `
@@ -95,13 +93,13 @@ export class ReproView {
       this.doi = doi;
       this.output = this.rows = this.outputCheck = undefined;
       try {
-        this.state = { ...freshState(), ...JSON.parse(await api.reproReadText(doi, STATE_FILE)) };
+        this.state = loadState(JSON.parse(await api.reproReadText(doi, STATE_FILE)));
       } catch {
-        this.state = freshState();
+        this.state = loadState(null);
       }
       this.folder = await api.reproPath(doi);
     }
-    if (step !== undefined) this.state.step = step;
+    if (step !== undefined) this.state.step = Math.min(step, STEPS.length - 1);
     await this.refreshFiles();
     this.render();
   }
@@ -135,7 +133,7 @@ export class ReproView {
   private async busy<T>(key: string, label: string, fn: () => Promise<T>): Promise<T | undefined> {
     this.running.add(key);
     this.setStatus(`⏳ ${label}…`);
-    this.refresh();
+    this.render();
     try {
       const r = await fn();
       this.setStatus(`${label} — done`);
@@ -146,13 +144,8 @@ export class ReproView {
       return undefined;
     } finally {
       this.running.delete(key);
-      this.refresh();
+      this.render();
     }
-  }
-
-  private refresh() {
-    if (this.side) this.side();
-    else this.render();
   }
 
   private showError(label: string, msg: string) {
@@ -166,10 +159,35 @@ export class ReproView {
 
   private async refreshFiles(hash = false) {
     this.files = await api.reproList(this.doi, hash).catch(() => []);
+    this.syncInputs();
   }
 
-  private filesIn(dir: string) {
-    return this.files.filter((f) => f.path.startsWith(dir + "/")).map((f) => f.path);
+  /** Keep the inputs table in step with inputs/ on disk: new files get a guessed role, deleted ones disappear. */
+  private syncInputs() {
+    const st = this.state;
+    const onDisk = this.files.filter((f) => f.path.startsWith("inputs/"));
+    const paths = new Set(onDisk.map((f) => f.path));
+    const kept = st.inputs.filter((i) => paths.has(i.path));
+    let changed = kept.length !== st.inputs.length;
+    const known = new Set(kept.map((i) => i.path));
+    for (const f of onDisk) {
+      if (known.has(f.path)) continue;
+      kept.push({ path: f.path, role: roleFor(f.path), note: "" });
+      changed = true;
+    }
+    const archives = st.archives.filter((a) => kept.some((i) => i.path.startsWith(a.dir + "/")));
+    changed ||= archives.length !== st.archives.length;
+    st.inputs = kept;
+    st.archives = archives;
+    if (changed) this.save();
+  }
+
+  private schema(): ResultsSchema | undefined {
+    return buildSchema(this.state, { doi: this.doi, title: this.ctx.meta()?.title });
+  }
+
+  private plan(): AnalysisPlan | undefined {
+    return buildPlan(this.state);
   }
 
   // ---------- rendering ----------
@@ -180,17 +198,22 @@ export class ReproView {
     (this.root.querySelector("#rp-back") as HTMLButtonElement).disabled = s === 0;
     const next = this.root.querySelector("#rp-next") as HTMLButtonElement;
     next.disabled = s === STEPS.length - 1;
-    next.textContent = s === 3 ? "Next: full run →" : "Next →";
+    next.textContent = s === STEP.codegen ? "Next: full run →" : "Next →";
     const body = this.root.querySelector<HTMLElement>("#rp-body")!;
-    const scroll = body.querySelector(".rp-scroll-keep")?.scrollTop;
-    this.side = undefined;
-    [this.renderTargets, this.renderPlan, this.renderScript, this.renderCodegen, this.renderRun, this.renderReport][s].call(this, body);
-    if (scroll !== undefined) body.querySelector(".rp-scroll-keep")?.scrollTo(0, scroll);
+    // Keep scroll positions when re-rendering the same step.
+    const sameStep = this.renderedStep === s;
+    const top = body.scrollTop;
+    const ev = body.querySelector("#rp-events");
+    if (ev && sameStep) this.eventsKeep = { top: ev.scrollTop, atEnd: nearEnd(ev) };
+    [this.renderInputs, this.renderTargets, this.renderPlan, this.renderScript, this.renderCodegen, this.renderRun, this.renderReport][s].call(this, body);
+    if (sameStep) body.scrollTop = top;
+    this.renderedStep = s;
     this.managePolling();
   }
 
   private managePolling() {
-    const need = (this.state.step === 3 && this.running.has("codegen")) || (this.state.step === 4 && this.running.has("run"));
+    const s = this.state.step;
+    const need = (s === STEP.codegen && this.running.has("codegen")) || (s === STEP.run && this.running.has("run"));
     if (need && !this.poll) this.poll = window.setInterval(() => this.pollStatus(), 2500);
     if (!need && this.poll) {
       clearInterval(this.poll);
@@ -200,144 +223,15 @@ export class ReproView {
 
   private async pollStatus() {
     await this.refreshFiles();
-    if (this.state.step === 3) await this.updateCodegenStatus();
-    if (this.state.step === 4) await this.updateRunLog();
-  }
-
-  private needModel(body: HTMLElement): DocModel | undefined {
-    const model = this.ctx.model();
-    if (!model) {
-      body.innerHTML = `<div class="empty">No structured reference text. Choose or generate one in the Reader first.</div>`;
-      return undefined;
-    }
-    return model;
+    if (this.state.step === STEP.codegen) await this.updateCodegenStatus();
+    if (this.state.step === STEP.run) await this.updateRunLog();
   }
 
   private sourceWarning(): string {
     const ref = this.ctx.refName();
     return this.state.source && this.state.source !== ref
-      ? `<p class="warn">Selections were made on <b>${esc(this.state.source)}</b>, but the current reference text is <b>${esc(ref)}</b>. Switch back in the Reader, or reselect here.</p>`
+      ? `<p class="warn">Article references were marked in <b>${esc(this.state.source)}</b>, but the current reference text is <b>${esc(ref)}</b>. Switch back in the Reader before marking more content.</p>`
       : "";
-  }
-
-  // ---------- step 1: targets & inputs ----------
-
-  private renderTargets(body: HTMLElement) {
-    const model = this.needModel(body);
-    if (!model) return;
-    body.innerHTML = `
-    <div class="rp-cols">
-      <section class="rp-card rp-tree-card">
-        <h3>Reproduction targets — select text</h3>
-        ${this.sourceWarning()}
-        <div class="actions">
-          <button data-sel="numbers">+ Sentences with numbers</button>
-          <button data-sel="results">+ "Results" sections</button>
-          <button data-sel="floats">+ All tables &amp; figures</button>
-          <button data-sel="none">Clear</button>
-        </div>
-        <div id="rp-tree" class="rp-scroll"></div>
-      </section>
-      <section id="rp-side" class="rp-side rp-scroll"></section>
-    </div>`;
-
-    this.tree = new SelectionTree(body.querySelector("#rp-tree")!, model, {
-      floats: true,
-      onChange: () => {
-        this.state.targetSel = this.tree!.ids;
-        this.state.source = this.ctx.refName();
-        this.save();
-        this.side?.();
-      },
-    });
-    this.tree.ids = this.state.targetSel;
-
-    body.querySelectorAll<HTMLButtonElement>("[data-sel]").forEach((b) =>
-      b.addEventListener("click", () => {
-        const t = this.tree!;
-        const mode = b.dataset.sel;
-        if (mode === "none") t.select(() => true, false);
-        if (mode === "floats") t.select((_, __, k) => k !== "sentence");
-        // digits, ignoring citation brackets and years
-        if (mode === "numbers") t.select((_, text, k) => k === "sentence" && /\d/.test(text.replace(/\[\d+(?:[,–-]\s*\d+)*\]|\b(19|20)\d\d\b/g, "")));
-        if (mode === "results") {
-          const ids = new Set(model.sections.filter((s) => /result|finding/i.test(s.title)).flatMap((s) => s.blocks.flatMap((b) => (b.kind === "p" ? b.sentences.map((x) => x.id) : []))));
-          t.select((id) => ids.has(id));
-        }
-      }),
-    );
-    const sideEl = body.querySelector<HTMLElement>("#rp-side")!;
-    this.side = () => this.renderTargetsSide(sideEl, model);
-    this.side();
-  }
-
-  private renderTargetsSide(el: HTMLElement, model: DocModel) {
-    const schema = this.state.schema;
-    const errs = schema ? validateResultsSchema(schema) : [];
-    const { sentences, blocks } = indexDoc(model);
-    const sel = this.state.targetSel;
-    const nS = sel.filter((id) => sentences.has(id)).length;
-    const nT = sel.filter((id) => blocks.get(id)?.block.kind === "table").length;
-    const nF = sel.filter((id) => blocks.get(id)?.block.kind === "figure").length;
-    const extracting = this.running.has("extract");
-    const scroll = el.scrollTop;
-    el.innerHTML = `
-        ${this.inputsCard()}
-        <div class="rp-card">
-          <h3>Results schema</h3>
-          <p>Selected: <b>${nS}</b> sentences, <b>${nT}</b> tables, <b>${nF}</b> figures.</p>
-          <div class="actions">
-            <button id="rp-extract" class="primary" ${extracting || !(nS + nT + nF) ? "disabled" : ""}>${extracting ? "Extracting…" : "Extract results with Claude"}</button>
-            <label><input type="checkbox" id="rp-append" ${schema?.results.length ? "checked" : ""}/> append to existing</label>
-            ${schema ? `<button id="rp-clear-schema">Discard schema</button>` : ""}
-          </div>
-          <p class="hint">Figures are added directly (no LLM); sentences and tables are parsed by Claude into typed results with unique IDs.</p>
-          ${schema ? this.validationBox(errs, [], "Results schema") + this.schemaTable(schema) : ""}
-        </div>`;
-    el.scrollTop = scroll;
-    this.bindInputs(el);
-    el.querySelector("#rp-extract")?.addEventListener("click", () => this.extractResults(model));
-    el.querySelector("#rp-clear-schema")?.addEventListener("click", () => {
-      if (!confirm("Discard all extracted results?")) return;
-      this.state.schema = undefined;
-      this.save();
-      this.refresh();
-    });
-    this.bindSchemaTable(el);
-  }
-
-  private inputsCard(): string {
-    const list = (dir: string) =>
-      this.filesIn(dir).map((p) => `<li><code>${esc(p.slice(dir.length + 1))}</code> <span class="muted">${(this.files.find((f) => f.path === p)!.size / 1024).toFixed(0)} KB</span> <button data-del="${esc(p)}" title="Remove">✕</button></li>`).join("") || `<li class="muted">none</li>`;
-    return `<div class="rp-card">
-      <h3>Inputs</h3>
-      <h4>Data files</h4><ul class="rp-files">${list("data")}</ul>
-      <label class="btn">Upload data…<input type="file" multiple hidden data-upload="data" /></label>
-      <h4>Code files <span class="muted">(optional: original analysis code, used as reference for generation)</span></h4><ul class="rp-files">${list("code")}</ul>
-      <label class="btn">Upload code…<input type="file" multiple hidden data-upload="code" /></label>
-    </div>`;
-  }
-
-  private bindInputs(body: HTMLElement) {
-    body.querySelectorAll<HTMLInputElement>("input[data-upload]").forEach((inp) =>
-      inp.addEventListener("change", async () => {
-        const dir = inp.dataset.upload!;
-        const list = Array.from(inp.files ?? []);
-        inp.value = "";
-        await this.busy("upload", `Uploading ${list.length} file(s)`, async () => {
-          for (const f of list) await api.reproWrite(this.doi, `${dir}/${f.name.replace(/[\\/]/g, "_")}`, new Uint8Array(await f.arrayBuffer()));
-          await this.refreshFiles();
-        });
-      }),
-    );
-    body.querySelectorAll<HTMLButtonElement>("button[data-del]").forEach((b) =>
-      b.addEventListener("click", async () => {
-        if (!confirm(`Remove ${b.dataset.del}?`)) return;
-        await api.reproDelete(this.doi, b.dataset.del!);
-        await this.refreshFiles();
-        this.refresh();
-      }),
-    );
   }
 
   private validationBox(errors: string[], warnings: string[], what: string): string {
@@ -346,272 +240,445 @@ export class ReproView {
       ${warnings.length ? `<details class="warn-soft"><summary>${warnings.length} warning(s)</summary><ul>${warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul></details>` : ""}`;
   }
 
-  private schemaTable(schema: ResultsSchema): string {
-    const row = (r: TargetResult, i: number) => {
-      const exp = r.type === "table" ? `<span class="muted">${(r.expected as string[][])?.length ?? 0}×${(r.expected as string[][])?.[0]?.length ?? 0} table</span>` : r.type === "figure" ? `<span class="muted">figure</span>` : `<input data-f="expected" data-i="${i}" value="${esc(r.expected)}" size="8" />`;
-      const cmp = r.type === "number" ? `<select data-f="comparator" data-i="${i}">${COMPARATORS.map((c) => `<option ${((r.comparator ?? "=") === c && "selected") || ""}>${c}</option>`).join("")}</select>` : "";
-      return `<tr>
-        <td><b>${r.id}</b><br><span class="badge">${r.type}</span></td>
-        <td><textarea data-f="description" data-i="${i}" rows="2">${esc(r.description)}</textarea><div class="quote">“${esc(trunc(r.quote, 200))}” <span class="muted">— ${esc(r.source_label ?? "")}</span></div></td>
-        <td class="nowrap">${cmp} ${exp}</td>
-        <td>${r.type === "number" ? `<input data-f="decimals" data-i="${i}" value="${r.decimals ?? ""}" size="2" title="decimals as reported" />` : ""}</td>
-        <td>${r.type === "number" ? `<input data-f="unit" data-i="${i}" value="${esc(r.unit ?? "")}" size="4" />` : ""}</td>
-        <td><button data-rm="${i}" title="Remove">✕</button></td></tr>`;
-    };
-    return `<table class="rp-table"><tr><th>ID</th><th>Description / quote</th><th>Expected</th><th>dp</th><th>Unit</th><th></th></tr>${schema.results.map(row).join("")}</table>`;
-  }
+  // ---------- step 1: inputs ----------
 
-  private bindSchemaTable(body: HTMLElement) {
-    const schema = this.state.schema;
-    if (!schema) return;
-    body.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("[data-f]").forEach((el) =>
-      el.addEventListener("change", () => {
-        const r = schema.results[Number(el.dataset.i)];
-        const f = el.dataset.f!;
-        const v = el.value.trim();
-        if (f === "expected") r.expected = r.type === "number" && v !== "" && !Number.isNaN(Number(v)) ? Number(v) : v;
-        else if (f === "decimals") r.decimals = v === "" ? undefined : Math.max(0, parseInt(v, 10) || 0);
-        else if (f === "comparator") r.comparator = v === "=" ? undefined : (v as TargetResult["comparator"]);
-        else if (f === "unit") r.unit = v || undefined;
-        else if (f === "description") r.description = v;
+  private renderInputs(body: HTMLElement) {
+    const st = this.state;
+    const size = (p: string) => this.files.find((f) => f.path === p)?.size ?? 0;
+    const archiveOf = (p: string) => st.archives.find((a) => p.startsWith(a.dir + "/"));
+    const roleSelect = (i: InputMeta) => `<select data-role ${i.excluded ? "disabled" : ""}>${ROLES.map((r) => `<option ${r === i.role ? "selected" : ""}>${r}</option>`).join("")}</select>`;
+    const note = (i: InputMeta) => `<input data-note value="${esc(i.note)}" placeholder="note" ${i.excluded ? "disabled" : ""} />`;
+    const loose = st.inputs.filter((i) => !archiveOf(i.path));
+    let rows = loose
+      .map((i) => `<tr data-path="${esc(i.path)}"><td><code>${esc(i.path.slice("inputs/".length))}</code></td><td>${roleSelect(i)}</td><td>${note(i)}</td><td class="nowrap">${sizeText(size(i.path))}</td><td><button data-del-file title="Delete this file">✕</button></td></tr>`)
+      .join("");
+    for (const a of st.archives) {
+      const members = st.inputs.filter((i) => i.path.startsWith(a.dir + "/"));
+      const off = members.filter((i) => i.excluded).length;
+      rows += `<tr class="rp-archive" data-archive="${esc(a.dir)}"><td colspan="3"><span class="badge">zip</span> <b>${esc(a.name)}</b> <span class="muted">unpacked to ${esc(a.dir)}/ · ${members.length} files${off ? `, ${off} not used` : ""}</span></td><td class="nowrap">${sizeText(members.reduce((n, i) => n + size(i.path), 0))}</td><td><button data-del-archive title="Remove the archive and all its files">✕</button></td></tr>`;
+      rows += members
+        .map((i) => `<tr class="rp-nested ${i.excluded ? "rp-disabled" : ""}" data-path="${esc(i.path)}"><td><code>${esc(i.path.slice(a.dir.length + 1))}</code></td><td>${roleSelect(i)}</td><td>${note(i)}</td><td class="nowrap">${sizeText(size(i.path))}</td><td>${i.excluded ? `<button data-include title="Use this file again">↺ Use</button>` : `<button data-exclude title="Don't use this file (it stays in the unpacked archive)">✕</button>`}</td></tr>`)
+        .join("");
+    }
+    const counts = ROLES.map((r) => `${usedInputs(st, r).length} ${r}`).join(" · ");
+    body.innerHTML = `
+    <div class="rp-card rp-drop">
+      <div class="rp-editor-head"><h3>Input files</h3><span class="muted">${counts}</span><span class="spacer"></span>
+        <label class="btn primary ${this.running.has("upload") ? "disabled" : ""}">Add files…<input type="file" multiple hidden id="rp-add-files" /></label></div>
+      <p class="hint">The study's data and, if available, the authors' original code. The role is guessed from the file type and can be changed; notes are passed on to the LLM and the report. Zip archives are unpacked; files inside an archive can be left out without changing the archive. You can also drop files here.</p>
+      <table class="rp-table rp-inputs"><thead><tr><th>File</th><th>Role</th><th>Note</th><th>Size</th><th></th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="5" class="muted">No input files yet.</td></tr>`}</tbody></table>
+    </div>`;
+
+    const card = body.querySelector<HTMLElement>(".rp-drop")!;
+    body.querySelector<HTMLInputElement>("#rp-add-files")!.addEventListener("change", (e) => {
+      const inp = e.target as HTMLInputElement;
+      const files = Array.from(inp.files ?? []);
+      inp.value = "";
+      if (files.length) this.addInputs(files);
+    });
+    card.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      card.classList.add("over");
+    });
+    card.addEventListener("dragleave", () => card.classList.remove("over"));
+    card.addEventListener("drop", (e) => {
+      e.preventDefault();
+      card.classList.remove("over");
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      if (files.length) this.addInputs(files);
+    });
+    const meta = (el: Element) => st.inputs.find((i) => i.path === el.closest<HTMLElement>("tr[data-path]")!.dataset.path);
+    body.querySelectorAll<HTMLSelectElement>("select[data-role]").forEach((sel) =>
+      sel.addEventListener("change", () => {
+        meta(sel)!.role = sel.value as Role;
         this.save();
-        if (f === "expected" || f === "decimals") this.refresh();
+        body.querySelector(".rp-editor-head .muted")!.textContent = ROLES.map((r) => `${usedInputs(st, r).length} ${r}`).join(" · ");
       }),
     );
-    body.querySelectorAll<HTMLButtonElement>("[data-rm]").forEach((b) =>
+    body.querySelectorAll<HTMLInputElement>("input[data-note]").forEach((inp) =>
+      inp.addEventListener("change", () => {
+        meta(inp)!.note = inp.value.trim();
+        this.save();
+      }),
+    );
+    body.querySelectorAll<HTMLButtonElement>("[data-exclude], [data-include]").forEach((b) =>
       b.addEventListener("click", () => {
-        schema.results.splice(Number(b.dataset.rm), 1);
+        meta(b)!.excluded = b.hasAttribute("data-exclude") || undefined;
         this.save();
-        this.refresh();
+        this.render();
+      }),
+    );
+    body.querySelectorAll<HTMLButtonElement>("[data-del-file]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const path = meta(b)!.path;
+        if (!(await confirmDialog("Delete input file", `Delete <code>${esc(path)}</code> from the package?`, "Delete", true))) return;
+        await api.reproDelete(this.doi, path);
+        await this.refreshFiles();
+        this.render();
+      }),
+    );
+    body.querySelectorAll<HTMLButtonElement>("[data-del-archive]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const dir = b.closest<HTMLElement>("tr")!.dataset.archive!;
+        const a = st.archives.find((x) => x.dir === dir)!;
+        const n = st.inputs.filter((i) => i.path.startsWith(dir + "/")).length;
+        if (!(await confirmDialog("Remove archive", `Remove <b>${esc(a.name)}</b> and all ${n} files unpacked from it?`, "Remove", true))) return;
+        await api.reproDelete(this.doi, dir);
+        st.archives = st.archives.filter((x) => x !== a);
+        await this.refreshFiles();
+        this.render();
       }),
     );
   }
 
-  private async extractResults(model: DocModel) {
-    const { sentences, blocks } = indexDoc(model);
-    const sel = this.state.targetSel;
-    const sentIds = sel.filter((id) => sentences.has(id));
-    const tableIds = sel.filter((id) => blocks.get(id)?.block.kind === "table");
-    const figIds = sel.filter((id) => blocks.get(id)?.block.kind === "figure");
-    const append = (this.root.querySelector("#rp-append") as HTMLInputElement | null)?.checked ?? false;
-    await this.busy("extract", "Extracting results", async () => {
-      const existing = append ? this.state.schema?.results ?? [] : [];
-      const start = Math.max(0, ...existing.map((r) => parseInt(r.id.slice(1), 10) || 0));
-      let found: TargetResult[] = [];
-      if (sentIds.length || tableIds.length) {
-        const out = await api.claudePrompt(this.doi, resultsPrompt(model, sentIds, tableIds));
-        found = toTargets(extractJson(out), model, start);
+  private async addInputs(files: File[]) {
+    await this.busy("upload", `Adding ${files.length} file(s)`, async () => {
+      for (const f of files) {
+        if (/\.zip$/i.test(f.name)) {
+          const r = await api.reproUnzip(this.doi, f, "inputs");
+          this.state.archives.push({ name: f.name, dir: r.dir });
+          continue;
+        }
+        const name = f.name.replace(/[\\/]/g, "_");
+        let path = `inputs/${name}`;
+        for (let i = 2; this.files.some((x) => x.path === path); i++) path = `inputs/${name.replace(/(\.[^.]*)?$/, (ext) => `-${i}${ext}`)}`;
+        await api.reproWrite(this.doi, path, new Uint8Array(await f.arrayBuffer()));
+        this.files.push({ path, size: f.size, modified: Date.now(), sha256: null });
       }
-      const haveFig = new Set(existing.filter((r) => r.type === "figure").flatMap((r) => r.source_ids));
-      const figs = figureTargets(model, figIds.filter((id) => !haveFig.has(id)), start + found.length);
-      const meta = this.ctx.meta();
-      this.state.schema = {
-        schema_version: "1.0",
-        paper: { doi: this.doi, title: meta?.title },
-        source_document: this.ctx.refName(),
-        results: [...existing, ...found, ...figs],
+      await this.refreshFiles();
+    });
+  }
+
+  // ---------- entry tables (targets, plan steps) ----------
+
+  private itemsTable<T extends { id: string }>(spec: TableSpec<T>): string {
+    const items = spec.items();
+    const ncol = spec.head.length + 3;
+    const rows = items.map((it, i) => (it.t === "llm" ? this.groupRows(spec, it, i, items.length, ncol) : this.entryRow(spec, it, undefined, i, items.length))).join("");
+    return `<table class="rp-table rp-items" data-table="${spec.key}"><thead><tr><th title="Use">Use</th><th>ID</th>${spec.head.map((h) => `<th>${h}</th>`).join("")}<th></th></tr></thead>
+      <tbody>${spec.top ?? ""}${rows || `<tr><td colspan="${ncol}" class="muted">${spec.empty}</td></tr>`}${spec.bottom ?? ""}</tbody></table>`;
+  }
+
+  private entryRow<T extends { id: string }>(spec: TableSpec<T>, e: Entry<T>, group: LlmGroup<T> | undefined, i: number, n: number): string {
+    const v = value(e);
+    return `<tr data-uid="${e.uid}" class="${group ? "rp-nested" : ""} ${e.disabled ? "rp-disabled" : ""}">
+      <td><input type="checkbox" data-act="toggle" ${e.disabled ? "" : "checked"} title="Use this ${spec.noun}" /></td>
+      <td class="rp-id">${this.idCell(e)}</td>
+      ${spec.cells(v, !!e.disabled).map((c) => `<td>${c}</td>`).join("")}
+      <td class="nowrap rp-row-actions">${this.rowActions(e, group, i, n)}</td></tr>`;
+  }
+
+  private idCell(e: Entry<{ id: string }>) {
+    return `<b>${esc(value(e).id)}</b>${e.edit ? `<br><span class="badge rp-edited" title="Changed from the LLM's extraction">edited</span>` : ""}`;
+  }
+
+  private rowActions(e: Entry<unknown>, group: LlmGroup<unknown> | undefined, i: number, n: number) {
+    const moves = `<button data-act="up" title="Move up" ${i === 0 ? "disabled" : ""}>↑</button><button data-act="down" title="Move down" ${i === n - 1 ? "disabled" : ""}>↓</button>`;
+    if (group) return moves + (isModified(e) ? `<button data-act="restore" title="Restore the LLM's extraction">↺ Restore</button>` : "");
+    return moves + `<button data-act="remove" title="Delete">✕</button>`;
+  }
+
+  private groupSummary<T>(spec: TableSpec<any>, g: LlmGroup<T>) {
+    const off = g.entries.filter((e) => e.disabled).length;
+    const edited = g.entries.filter((e) => e.edit).length;
+    const c = g.call.scanned;
+    const scanned = [`${c.sentences} sentences`, c.tables && `${c.tables} tables`, c.figures && `${c.figures} figures`].filter(Boolean).join(", ");
+    return `${esc(new Date(g.call.at).toLocaleString())} · model ${esc(g.call.model || "default")} · scanned ${scanned} · ${g.entries.length} ${spec.noun}s${off ? `, ${off} not used` : ""}${edited ? `, ${edited} edited` : ""}`;
+  }
+
+  private groupRows<T extends { id: string }>(spec: TableSpec<T>, g: LlmGroup<T>, i: number, n: number, ncol: number): string {
+    const head = `<tr class="rp-group" data-uid="${g.uid}"><td colspan="${ncol}"><div class="rp-group-head">
+        <button data-act="collapse" class="rp-twisty" title="${g.collapsed ? "Expand" : "Collapse"}">${g.collapsed ? "▸" : "▾"}</button>
+        <b>LLM call</b><span class="muted rp-group-sum">${this.groupSummary(spec, g)}</span><span class="spacer"></span>
+        <button data-act="details">Call details</button>
+        <button data-act="up" title="Move up" ${i === 0 ? "disabled" : ""}>↑</button><button data-act="down" title="Move down" ${i === n - 1 ? "disabled" : ""}>↓</button>
+        <button data-act="discard" class="danger-text">Discard…</button></div></td></tr>`;
+    return head + (g.collapsed ? "" : g.entries.map((e, j) => this.entryRow(spec, e, g, j, g.entries.length)).join(""));
+  }
+
+  private bindTable<T extends { id: string }>(body: HTMLElement, spec: TableSpec<T>, after: () => void) {
+    const table = body.querySelector<HTMLElement>(`table[data-table="${spec.key}"]`);
+    if (!table) return;
+    const locate = (el: Element) => {
+      const tr = el.closest<HTMLElement>("tr[data-uid]");
+      return tr ? { tr, hit: findEntry(spec.items(), tr.dataset.uid!) } : undefined;
+    };
+    table.addEventListener("change", (ev) => {
+      const el = ev.target as HTMLInputElement;
+      const at = locate(el);
+      const e = at?.hit?.entry;
+      if (!at || !e) return;
+      if (el.dataset.act === "toggle") {
+        e.disabled = !el.checked || undefined;
+        this.save();
+        return this.render();
+      }
+      const f = el.dataset.f;
+      if (!f) return;
+      setField(e, f as keyof T, spec.parse(f, el.value.trim(), value(e)) as T[keyof T]);
+      this.save();
+      // Update markers in place so the next field the user clicked keeps focus.
+      at.tr.querySelector(".rp-id")!.innerHTML = this.idCell(e);
+      const list = at.hit!.list as unknown[];
+      at.tr.querySelector(".rp-row-actions")!.innerHTML = this.rowActions(e, at.hit!.group, list.indexOf(e), list.length);
+      const g = at.hit!.group;
+      if (g) table.querySelector(`tr[data-uid="${g.uid}"] .rp-group-sum`)!.innerHTML = this.groupSummary(spec, g);
+      after();
+    });
+    table.addEventListener("click", async (ev) => {
+      const b = (ev.target as HTMLElement).closest<HTMLButtonElement>("button[data-act]");
+      const at = b && locate(b);
+      if (!b || !at?.hit) return;
+      const { entry, group, list } = at.hit;
+      const act = b.dataset.act;
+      const target = (entry ?? group)!;
+      if (act === "up" || act === "down") move(list as unknown[], (list as unknown[]).indexOf(target), act === "up" ? -1 : 1);
+      if (act === "restore" && entry) restore(entry);
+      if (act === "remove" && entry) {
+        if (!(await confirmDialog(`Delete ${spec.noun}`, `Delete <b>${esc(value(entry).id)}</b>?`, "Delete", true))) return;
+        (list as unknown[]).splice((list as unknown[]).indexOf(entry), 1);
+      }
+      if (group && !entry) {
+        if (act === "collapse") group.collapsed = !group.collapsed || undefined;
+        if (act === "details") return void callDetailsDialog(`LLM call · ${spec.noun}s`, group.call);
+        if (act === "discard") {
+          const edited = group.entries.filter((e) => isModified(e)).length;
+          const ok = await confirmDialog(
+            "Discard LLM call",
+            `Remove this LLM call and all ${group.entries.length} ${spec.noun}s extracted by it${edited ? `, including your changes to ${edited} of them` : ""}? This can't be undone.`,
+            "Discard",
+            true,
+          );
+          if (!ok) return;
+          (list as unknown[]).splice((list as unknown[]).indexOf(group), 1);
+        }
+      }
+      this.save();
+      this.render();
+    });
+  }
+
+  private async addEntry<T extends { id: string }>(items: Item<T>[], v: T | undefined) {
+    if (!v) return;
+    items.push({ t: "row", uid: uid(), base: v, manual: true });
+    if (v && (v as any).source_ids?.length) this.state.source = this.ctx.refName();
+    this.save();
+    this.render();
+  }
+
+  /** Run a prompt chosen in the LLM dialog and add its extractions as one group. */
+  private async runLlm<T>(key: string, label: string, items: Item<T>[], choice: LlmChoice, scanned: LlmCall["scanned"], toEntries: (output: string) => T[]) {
+    await this.busy(key, label, async () => {
+      const t0 = Date.now();
+      const output = await api.claudePrompt(this.doi, choice.prompt, { model: choice.model });
+      const values = toEntries(output);
+      const call: LlmCall = {
+        at: new Date().toISOString(), argv: choice.argv, model: modelOf(choice.argv), instructions: choice.instructions,
+        prompt: choice.prompt, output, duration_ms: Date.now() - t0, scanned,
       };
+      items.push({ t: "llm", uid: uid(), call, entries: values.map((base) => ({ t: "row", uid: uid(), base })) });
       this.state.source = this.ctx.refName();
       this.save();
     });
   }
 
-  // ---------- step 2: analysis plan ----------
+  private withInstructions = (prompt: string, instructions: string) => (instructions ? `${prompt}\nAdditional instructions:\n${instructions}\n` : prompt);
+
+  // ---------- step 2: targets ----------
+
+  private targetSpec(): TableSpec<TargetResult> {
+    return {
+      key: "targets",
+      noun: "target",
+      items: () => this.state.targets,
+      head: ["Type", "Description / quote", "Expected", "Cmp", "dp", "Unit"],
+      empty: "No targets yet. Generate them with the LLM or add them by hand.",
+      cells: (r, dis) => {
+        const d = dis ? "disabled" : "";
+        const exp = r.type === "table" ? `<span class="muted">${(r.expected as string[][])?.length ?? 0}×${(r.expected as string[][])?.[0]?.length ?? 0} table</span>` : r.type === "figure" ? `<span class="muted">figure</span>` : `<input data-f="expected" value="${esc(r.expected)}" size="8" ${d} />`;
+        return [
+          `<span class="badge">${r.type}</span>`,
+          `<textarea data-f="description" rows="2" ${d}>${esc(r.description)}</textarea>${r.quote ? `<div class="quote">“${esc(trunc(r.quote, 220))}” <span class="muted">— ${esc(r.source_label ?? "")}${r.source_ids.length ? ` (${r.source_ids.length} ref${r.source_ids.length > 1 ? "s" : ""})` : ""}</span></div>` : ""}`,
+          exp,
+          r.type === "number" ? `<select data-f="comparator" ${d}>${COMPARATORS.map((c) => `<option ${(r.comparator ?? "=") === c ? "selected" : ""}>${c}</option>`).join("")}</select>` : "",
+          r.type === "number" ? `<input data-f="decimals" value="${r.decimals ?? ""}" size="2" title="decimals as reported" ${d} />` : "",
+          r.type === "number" ? `<input data-f="unit" value="${esc(r.unit ?? "")}" size="4" ${d} />` : "",
+        ];
+      },
+      parse: (f, v, r) => {
+        if (f === "expected") return r.type === "number" && v !== "" && !Number.isNaN(Number(v)) ? Number(v) : v;
+        if (f === "decimals") return v === "" ? undefined : Math.max(0, parseInt(v, 10) || 0);
+        if (f === "comparator") return v === "=" ? undefined : v;
+        if (f === "unit") return v || undefined;
+        return v;
+      },
+    };
+  }
+
+  private renderTargets(body: HTMLElement) {
+    const model = this.ctx.model();
+    const schema = this.schema();
+    const spec = this.targetSpec();
+    const generating = this.running.has("llm-targets");
+    body.innerHTML = `
+    <div class="rp-card">
+      <div class="rp-editor-head"><h3>Reproduction targets</h3><span class="spacer"></span>
+        <button id="rp-add-row">+ Add target…</button>
+        <button id="rp-llm" class="primary" ${generating || !model ? "disabled" : ""} title="${model ? "" : "Needs a structured reference text (Reader)"}">${generating ? "Generating…" : "Generate with LLM…"}</button></div>
+      ${this.sourceWarning()}
+      <p class="hint">The reported results the reproduction should recompute. Rows from an LLM call are grouped under it; your changes are kept on top of the LLM's extraction and can be restored. Unticked rows are not used.</p>
+      <div id="rp-valid">${schema ? this.validationBox(validateResultsSchema(schema), [], "Results schema") : ""}</div>
+      ${this.itemsTable(spec)}
+    </div>`;
+    this.bindTable(body, spec, () => {
+      const s = this.schema();
+      body.querySelector("#rp-valid")!.innerHTML = s ? this.validationBox(validateResultsSchema(s), [], "Results schema") : "";
+    });
+    body.querySelector("#rp-add-row")!.addEventListener("click", async () => {
+      const id = `R${String(nextNumber(this.state.targets, "R")).padStart(3, "0")}`;
+      this.addEntry(this.state.targets, await addTargetDialog(model, id));
+    });
+    body.querySelector("#rp-llm")!.addEventListener("click", () => this.generateTargets(model!));
+  }
+
+  private async generateTargets(model: DocModel) {
+    const choice = await llmDialog({
+      title: "Generate targets with LLM",
+      intro: "The LLM reads the marked sentences and tables and returns one target per reported result. Marked figures are added as figure targets directly.",
+      model,
+      floats: true,
+      presets: TARGET_PRESETS,
+      initial: this.state.targetSel,
+      buildPrompt: (ids, instr) => {
+        const { sentences, blocks } = indexDoc(model);
+        return this.withInstructions(resultsPrompt(model, ids.filter((id) => sentences.has(id)), ids.filter((id) => blocks.get(id)?.block.kind === "table")), instr);
+      },
+      command: (m) => api.llmCommand(this.doi, "prompt", { model: m }),
+    });
+    if (!choice) return;
+    this.state.targetSel = choice.ids;
+    const { blocks } = indexDoc(model);
+    const figIds = choice.ids.filter((id) => blocks.get(id)?.block.kind === "figure");
+    const haveFig = new Set(allEntries(this.state.targets).filter((e) => e.base.type === "figure").flatMap((e) => e.base.source_ids));
+    const scanned = scannedCounts(model, choice.ids);
+    const start = nextNumber(this.state.targets, "R") - 1;
+    if (!scanned.sentences && !scanned.tables) {
+      // Only figures: nothing for the LLM to read.
+      for (const f of figureTargets(model, figIds.filter((id) => !haveFig.has(id)), start)) this.state.targets.push({ t: "row", uid: uid(), base: f, manual: true });
+      this.save();
+      return this.render();
+    }
+    await this.runLlm("llm-targets", "Generating targets", this.state.targets, choice, scanned, (out) => {
+      const found = toTargets(extractJson(out), model, start);
+      return [...found, ...figureTargets(model, figIds.filter((id) => !haveFig.has(id)), start + found.length)];
+    });
+  }
+
+  // ---------- step 3: analysis plan ----------
+
+  private stepSpec(plan: AnalysisPlan | undefined): TableSpec<StepDraft> {
+    const fixed = (s: AnalysisPlan["steps"][number], note: string) =>
+      `<tr class="rp-fixed"><td title="Added automatically">🔒</td><td><b>${s.id}</b></td><td><span class="badge">${s.kind}</span></td><td>${esc(s.summary)} <span class="muted">${note}</span></td><td>${s.inputs.map((p) => `<code>${esc(p)}</code>`).join(" ")}</td><td>${esc(s.depends_on.join(", "))}</td><td>${s.kind === "results" ? `<span class="muted">all targets</span>` : ""}</td><td></td></tr>`;
+    const loads = plan?.steps.filter((s) => s.kind === "load") ?? [];
+    const out = plan?.steps.find((s) => s.kind === "results");
+    return {
+      key: "steps",
+      noun: "step",
+      items: () => this.state.steps,
+      head: ["Kind", "Summary / quote", "Inputs", "Depends on", "Produces"],
+      empty: "No steps yet. Generate them with the LLM or add them by hand.",
+      top: loads.map((s) => fixed(s, "(one per data file of step 1)")).join(""),
+      bottom: out ? fixed(out, "") : "",
+      cells: (s, dis) => {
+        const d = dis ? "disabled" : "";
+        return [
+          `<select data-f="kind" ${d}>${["analysis", "transform"].map((k) => `<option ${s.kind === k ? "selected" : ""}>${k}</option>`).join("")}</select>`,
+          `<textarea data-f="summary" rows="2" ${d}>${esc(s.summary)}</textarea>${s.quote ? `<div class="quote">“${esc(trunc(s.quote, 220))}”</div>` : ""}`,
+          `<input data-f="inputs" value="${esc(s.inputs.join(", "))}" ${d} title="data files, comma-separated" />`,
+          `<input data-f="depends_on" value="${esc(s.depends_on.join(", "))}" size="8" ${d} title="step ids, comma-separated" />`,
+          `<input data-f="produces" value="${esc(s.produces.join(", "))}" size="10" ${d} title="target ids, comma-separated" />`,
+        ];
+      },
+      parse: (f, v) => (f === "inputs" || f === "depends_on" || f === "produces" ? list(v) : v),
+    };
+  }
 
   private renderPlan(body: HTMLElement) {
-    const model = this.needModel(body);
-    if (!model) return;
+    const st = this.state;
+    const model = this.ctx.model();
+    const plan = this.plan();
+    const spec = this.stepSpec(plan);
+    const generating = this.running.has("llm-plan");
+    const warnings = [
+      !usedInputs(st, "data").length && "No data files in step 1; load steps are generated from them.",
+      !this.schema()?.results.length && "No targets yet (step 2); steps can't be linked to target ids.",
+    ].filter(Boolean) as string[];
     body.innerHTML = `
-    <div class="rp-cols">
-      <section class="rp-card rp-tree-card">
-        <h3>Analysis plan — select methods text</h3>
-        ${this.sourceWarning()}
-        <div class="actions">
-          <button data-sel="methods">+ Methods-like sections</button>
-          <button data-sel="none">Clear</button>
-        </div>
-        <div id="rp-tree" class="rp-scroll"></div>
-      </section>
-      <section id="rp-side" class="rp-side rp-scroll"></section>
+    <div class="rp-card">
+      <div class="rp-editor-head"><h3>Analysis plan</h3><span class="spacer"></span>
+        <button id="rp-add-row">+ Add step…</button>
+        <button id="rp-llm" class="primary" ${generating || !model ? "disabled" : ""} title="${model ? "" : "Needs a structured reference text (Reader)"}">${generating ? "Generating…" : "Generate with LLM…"}</button></div>
+      ${this.sourceWarning()}
+      ${warnings.map((w) => `<p class="warn-soft">${esc(w)}</p>`).join("")}
+      <p class="hint">Load steps (one per data file) always come first and the results step last; the steps in between run in table order. Rows from an LLM call are grouped under it; your changes are kept on top of the LLM's extraction and can be restored.</p>
+      <div id="rp-valid">${plan ? this.validationBox(validatePlan(plan), [], "Analysis plan") : ""}</div>
+      ${this.itemsTable(spec)}
     </div>`;
+    this.bindTable(body, spec, () => {
+      const p = this.plan();
+      body.querySelector("#rp-valid")!.innerHTML = p ? this.validationBox(validatePlan(p), [], "Analysis plan") : "";
+    });
+    body.querySelector("#rp-add-row")!.addEventListener("click", async () => {
+      const id = `S${String(nextNumber(st.steps, "S")).padStart(2, "0")}`;
+      const draft = await addStepDialog(model, id, {
+        dataInputs: usedInputs(st, "data").map((i) => i.path),
+        steps: allEntries(st.steps).filter((e) => !e.disabled).map((e) => ({ id: value(e).id, summary: value(e).summary })),
+        targets: (this.schema()?.results ?? []).map((r) => ({ id: r.id, description: r.description })),
+      });
+      this.addEntry(st.steps, draft);
+    });
+    body.querySelector("#rp-llm")!.addEventListener("click", () => this.generateSteps(model!));
+  }
 
-    this.tree = new SelectionTree(body.querySelector("#rp-tree")!, model, {
+  private async generateSteps(model: DocModel) {
+    const st = this.state;
+    const promptInputs = (role: Role) => usedInputs(st, role).map((i) => ({ path: i.path, note: i.note }));
+    const choice = await llmDialog({
+      title: "Generate analysis steps with LLM",
+      intro: "The LLM turns the marked methods text into ordered analysis steps, linked to the data files and target ids.",
+      model,
       floats: false,
-      onChange: () => {
-        this.state.planSel = this.tree!.ids;
-        this.state.source = this.ctx.refName();
-        this.save();
-        this.side?.();
-      },
+      presets: PLAN_PRESETS,
+      initial: st.planSel,
+      buildPrompt: (ids, instr) => this.withInstructions(planPrompt(model, ids, promptInputs("data"), promptInputs("code"), this.schema()), instr),
+      command: (m) => api.llmCommand(this.doi, "prompt", { model: m }),
     });
-    this.tree.ids = this.state.planSel;
-    body.querySelectorAll<HTMLButtonElement>("[data-sel]").forEach((b) =>
-      b.addEventListener("click", () => {
-        if (b.dataset.sel === "none") return this.tree!.select(() => true, false);
-        const ids = new Set(model.sections.filter((s) => /method|material|procedure|analys|statistic|data|model|design|measure/i.test(s.title)).flatMap((s) => s.blocks.flatMap((x) => (x.kind === "p" ? x.sentences.map((y) => y.id) : []))));
-        this.tree!.select((id) => ids.has(id));
-      }),
-    );
-    const sideEl = body.querySelector<HTMLElement>("#rp-side")!;
-    this.side = () => this.renderPlanSide(sideEl, model);
-    this.side();
-  }
-
-  private renderPlanSide(el: HTMLElement, model: DocModel) {
-    this.syncLoadSteps();
-    const plan = this.state.plan;
-    const errs = plan ? validatePlan(plan) : [];
-    const planning = this.running.has("plan");
-    const { sentences } = indexDoc(model);
-    const nS = this.state.planSel.filter((id) => sentences.has(id)).length;
-    const data = this.filesIn("data");
-    const scroll = el.scrollTop;
-    el.innerHTML = `
-        <div class="rp-card">
-          <h3>Steps</h3>
-          ${!data.length ? `<p class="warn">No data files uploaded yet (step 1). Load steps are generated from uploaded data.</p>` : ""}
-          ${!this.state.schema ? `<p class="warn-soft">No results schema yet; steps won't be linked to result IDs.</p>` : ""}
-          <div class="actions">
-            <button id="rp-mkplan" class="primary" ${planning || !nS ? "disabled" : ""}>${planning ? "Planning…" : `Build plan from ${nS} sentences with Claude`}</button>
-            <button id="rp-addstep" ${plan ? "" : "disabled"}>+ Add step</button>
-            ${plan ? `<button id="rp-clear-plan">Discard plan</button>` : ""}
-          </div>
-          ${plan ? this.validationBox(errs, [], "Analysis plan") + this.stepsList(plan) : `<p class="hint">Load steps (one per data file) are always first and a results step is always last; the steps in between come from the selected text and can be reordered.</p>`}
-        </div>`;
-    el.scrollTop = scroll;
-    el.querySelector("#rp-mkplan")?.addEventListener("click", () => this.buildPlan(model));
-    el.querySelector("#rp-clear-plan")?.addEventListener("click", () => {
-      if (!confirm("Discard the analysis plan?")) return;
-      this.state.plan = undefined;
-      this.save();
-      this.refresh();
-    });
-    el.querySelector("#rp-addstep")?.addEventListener("click", () => {
-      const p = this.state.plan!;
-      const n = Math.max(...p.steps.map((s) => parseInt(s.id.slice(1), 10) || 0)) + 1;
-      const resultsIdx = p.steps.findIndex((s) => s.kind === "results");
-      const prev = p.steps[resultsIdx - 1];
-      const step: PlanStep = { id: `S${String(n).padStart(2, "0")}`, kind: "analysis", summary: "New step", quote: "", source_ids: [], inputs: [], depends_on: prev ? [prev.id] : [], produces: [] };
-      p.steps.splice(resultsIdx, 0, step);
-      p.steps[p.steps.length - 1].depends_on.push(step.id);
-      if (!this.state.scriptDirty) this.state.script = "";
-      this.save();
-      this.refresh();
-    });
-    this.bindSteps(el);
-  }
-
-  /** Keep load steps in sync with uploaded data files. */
-  private syncLoadSteps() {
-    const plan = this.state.plan;
-    if (!plan) return;
-    const data = this.filesIn("data");
-    const loads = plan.steps.filter((s) => s.kind === "load");
-    const stale = loads.filter((s) => !data.includes(s.inputs[0])).map((s) => s.id);
-    let changed = stale.length > 0;
-    plan.steps = plan.steps.filter((s) => !stale.includes(s.id));
-    plan.steps.forEach((s) => (s.depends_on = s.depends_on.filter((d) => !stale.includes(d))));
-    const have = new Set(plan.steps.filter((s) => s.kind === "load").map((s) => s.inputs[0]));
-    let n = Math.max(0, ...plan.steps.map((s) => parseInt(s.id.slice(1), 10) || 0));
-    const insertAt = plan.steps.filter((s) => s.kind === "load").length;
-    const added = data.filter((f) => !have.has(f)).map((f): PlanStep => ({ id: `S${String(++n).padStart(2, "0")}`, kind: "load", summary: `Load ${f}`, quote: "", source_ids: [], inputs: [f], depends_on: [], produces: [] }));
-    if (added.length) {
-      plan.steps.splice(insertAt, 0, ...added);
-      changed = true;
-    }
-    if (changed) this.save();
-  }
-
-  private stepsList(plan: AnalysisPlan): string {
-    const nLoad = plan.steps.filter((s) => s.kind === "load").length;
-    const last = plan.steps.length - 1;
-    return `<ol class="rp-steps">${plan.steps
-      .map((s, i) => {
-        const locked = s.kind === "load" || s.kind === "results";
-        const canUp = !locked && i > nLoad;
-        const canDown = !locked && i < last - 1;
-        return `<li class="rp-step k-${s.kind}">
-          <div class="rp-step-head"><b>${s.id}</b> <span class="badge">${s.kind}</span>
-            <span class="spacer"></span>
-            ${locked ? `<span class="muted" title="Load steps are always first and the results step last">🔒</span>` : `<button data-mv="${i}" data-d="-1" ${canUp ? "" : "disabled"}>↑</button><button data-mv="${i}" data-d="1" ${canDown ? "" : "disabled"}>↓</button><button data-rmstep="${i}">✕</button>`}
-          </div>
-          <textarea data-sf="summary" data-i="${i}" rows="2">${esc(s.summary)}</textarea>
-          ${s.quote ? `<div class="quote">“${esc(s.quote)}”</div>` : ""}
-          <div class="rp-step-meta">
-            <label>depends on <input data-sf="depends_on" data-i="${i}" value="${esc(s.depends_on.join(", "))}" /></label>
-            ${s.kind !== "load" && s.kind !== "results" ? `<label>produces <input data-sf="produces" data-i="${i}" value="${esc(s.produces.join(", "))}" /></label>` : s.inputs.length ? `<code>${esc(s.inputs.join(", "))}</code>` : `<span class="muted">produces all results</span>`}
-          </div>
-        </li>`;
-      })
-      .join("")}</ol>`;
-  }
-
-  private bindSteps(body: HTMLElement) {
-    const plan = this.state.plan;
-    if (!plan) return;
-    const touched = () => {
-      if (!this.state.scriptDirty) this.state.script = "";
-      this.save();
-    };
-    body.querySelectorAll<HTMLButtonElement>("[data-mv]").forEach((b) =>
-      b.addEventListener("click", () => {
-        const i = Number(b.dataset.mv);
-        const j = i + Number(b.dataset.d);
-        [plan.steps[i], plan.steps[j]] = [plan.steps[j], plan.steps[i]];
-        touched();
-        this.refresh();
-      }),
-    );
-    body.querySelectorAll<HTMLButtonElement>("[data-rmstep]").forEach((b) =>
-      b.addEventListener("click", () => {
-        const [gone] = plan.steps.splice(Number(b.dataset.rmstep), 1);
-        // Re-wire dependents to the removed step's own dependencies.
-        for (const s of plan.steps) if (s.depends_on.includes(gone.id)) s.depends_on = [...new Set([...s.depends_on.filter((d) => d !== gone.id), ...gone.depends_on])];
-        touched();
-        this.refresh();
-      }),
-    );
-    body.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("[data-sf]").forEach((el) =>
-      el.addEventListener("change", () => {
-        const s = plan.steps[Number(el.dataset.i)];
-        const f = el.dataset.sf!;
-        if (f === "summary") s.summary = el.value.trim();
-        else (s as any)[f] = el.value.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
-        touched();
-        if (f !== "summary") this.refresh();
-      }),
+    if (!choice) return;
+    st.planSel = choice.ids;
+    const start = nextNumber(st.steps, "S");
+    await this.runLlm("llm-plan", "Generating analysis steps", st.steps, choice, scannedCounts(model, choice.ids), (out) =>
+      toStepDrafts(extractJson(out), usedInputs(st, "data").map((i) => i.path), start),
     );
   }
 
-  private async buildPlan(model: DocModel) {
-    if (this.state.plan && !confirm("Replace the current plan?")) return;
-    const data = this.filesIn("data");
-    await this.busy("plan", "Building analysis plan", async () => {
-      const out = await api.claudePrompt(this.doi, planPrompt(model, this.state.planSel, data, this.filesIn("code"), this.state.schema));
-      this.state.plan = toPlan(extractJson(out), data, this.state.schema);
-      if (!this.state.scriptDirty) this.state.script = "";
-      this.save();
-    });
-  }
-
-  // ---------- step 3: master script ----------
+  // ---------- step 4: master script ----------
 
   private scriptFor(t: TemplateId) {
-    const plan = this.state.plan ?? { schema_version: "1.0" as const, steps: [] };
-    return masterScript(t, plan, this.state.schema, this.ctx.meta()?.title ?? this.doi);
+    const plan = this.plan() ?? { schema_version: "1.0" as const, steps: [] };
+    return masterScript(t, plan, this.schema(), this.ctx.meta()?.title ?? this.doi);
   }
 
   private renderScript(body: HTMLElement) {
     const st = this.state;
-    if (!st.script) {
-      st.script = this.scriptFor(st.template);
-      st.scriptDirty = false;
-    }
+    if (!st.scriptDirty) st.script = this.scriptFor(st.template);
+    const schema = this.schema();
+    const plan = this.plan();
     const issues = [
-      !st.schema && "no results schema (step 1)",
-      !st.plan && "no analysis plan (step 2)",
-      st.schema && validateResultsSchema(st.schema).length && "results schema is not valid",
-      st.plan && validatePlan(st.plan).length && "analysis plan is not valid",
+      !schema?.results.length && "no targets (step 2)",
+      !plan && "no analysis plan (step 3)",
+      schema && validateResultsSchema(schema).length && "results schema is not valid",
+      plan && validatePlan(plan).length && "analysis plan is not valid",
     ].filter(Boolean) as string[];
     const todo = (st.script.match(/TODO\(LLM\)/g) ?? []).length;
 
@@ -625,8 +692,9 @@ export class ReproView {
         <h3>Package</h3>
         ${issues.length ? `<div class="warn">⚠ ${issues.map(esc).join("<br>⚠ ")}</div>` : ""}
         <p>Folder: <code class="path">${esc(this.folder)}</code> <button id="rp-copy-path">Copy</button></p>
+        <p class="hint">Creating the package writes the files below and commits them to a git repository in the folder (initialized on first use), so later changes, e.g. by the code generation, can be tracked.</p>
         <div class="actions"><button id="rp-package" class="primary" ${this.running.has("package") ? "disabled" : ""}>${st.packaged ? "Update package" : "OK — create package"}</button></div>
-        ${st.packaged ? `<p class="ok">✓ Package created ${esc(new Date(st.packaged.at).toLocaleString())} (${TEMPLATES[st.packaged.template].label}).</p>` : ""}
+        ${st.packaged ? `<p class="ok">✓ Package ${st.packaged.commit ? "committed" : "created"} ${esc(new Date(st.packaged.at).toLocaleString())} (${TEMPLATES[st.packaged.template].label})${st.packaged.commit ? `<br><code>${esc(st.packaged.commit)}</code>` : ""}</p>` : ""}
         ${this.files.length ? `<details ${st.packaged ? "open" : ""}><summary>${this.files.length} files</summary><pre class="rp-tree-txt">${esc(this.files.map((f) => f.path).join("\n"))}</pre></details>` : ""}
       </section>
       <section class="rp-card rp-editor">
@@ -636,8 +704,8 @@ export class ReproView {
     </div>`;
 
     body.querySelectorAll<HTMLInputElement>("input[name=tpl]").forEach((r) =>
-      r.addEventListener("change", () => {
-        if (st.scriptDirty && !confirm("Switching template regenerates the script and discards your edits. Continue?")) return this.render();
+      r.addEventListener("change", async () => {
+        if (st.scriptDirty && !(await confirmDialog("Switch template", "Switching template regenerates the script and discards your edits.", "Switch", true))) return this.render();
         st.template = r.value as TemplateId;
         st.script = this.scriptFor(st.template);
         st.scriptDirty = false;
@@ -646,8 +714,8 @@ export class ReproView {
         this.render();
       }),
     );
-    body.querySelector("#rp-regen")!.addEventListener("click", () => {
-      if (st.scriptDirty && !confirm("Discard your edits and regenerate from the plan?")) return;
+    body.querySelector("#rp-regen")!.addEventListener("click", async () => {
+      if (st.scriptDirty && !(await confirmDialog("Regenerate script", "Discard your edits and regenerate from the plan?", "Regenerate", true))) return;
       st.script = this.scriptFor(st.template);
       st.scriptDirty = false;
       this.save();
@@ -658,25 +726,25 @@ export class ReproView {
       st.scriptDirty = true;
       this.save();
     });
-    body.querySelector("#rp-copy-path")!.addEventListener("click", () => navigator.clipboard.writeText(this.folder));
+    body.querySelector("#rp-copy-path")!.addEventListener("click", () => navigator.clipboard.writeText(this.folder).then(() => this.setStatus("Path copied")));
     body.querySelector("#rp-package")!.addEventListener("click", () => this.createPackage());
   }
 
   private async createPackage() {
     const st = this.state;
-    if (!st.schema || !st.plan) return this.showError("Create package", "A results schema (step 1) and an analysis plan (step 2) are required.");
-    const errs = [...validateResultsSchema(st.schema), ...validatePlan(st.plan)];
-    if (errs.length && !confirm(`The schemas have ${errs.length} validation problem(s):\n\n${errs.slice(0, 8).join("\n")}\n\nCreate the package anyway?`)) return;
+    const schema = this.schema();
+    const plan = this.plan();
+    if (!schema?.results.length || !plan) return this.showError("Create package", "Targets (step 2) and an analysis plan (step 3) are required.");
+    const errs = [...validateResultsSchema(schema), ...validatePlan(plan)];
+    if (errs.length && !(await confirmDialog("Validation problems", `The schemas have ${errs.length} validation problem(s):<ul>${errs.slice(0, 8).map((e) => `<li>${esc(e)}</li>`).join("")}</ul>Create the package anyway?`, "Create anyway"))) return;
     const scriptPath = TEMPLATES[st.template].script;
-    const existing = this.files.find((f) => f.path === scriptPath);
-    if (existing) {
+    let writeScript = true;
+    if (this.files.some((f) => f.path === scriptPath)) {
       const cur = await api.reproReadText(this.doi, scriptPath);
-      if (cur !== st.script && !cur.includes(TODO_MARK) && !confirm(`${scriptPath} in the folder already contains generated code. Overwrite it with the placeholder script?`)) {
-        await this.busy("package", "Updating package (keeping script)", () => this.writePackage(false));
-        return;
-      }
+      if (cur !== st.script && !cur.includes(TODO_MARK))
+        writeScript = await confirmDialog("Overwrite script?", `<code>${esc(scriptPath)}</code> in the folder already contains generated code. Overwrite it with the placeholder script? (Its current version stays in the git history.)`, "Overwrite", true);
     }
-    await this.busy("package", "Creating package", () => this.writePackage(true));
+    await this.busy("package", writeScript ? "Creating package" : "Updating package (keeping script)", () => this.writePackage(writeScript));
   }
 
   private async writePackage(writeScript: boolean) {
@@ -685,8 +753,10 @@ export class ReproView {
     const title = this.ctx.meta()?.title ?? doi;
     const json = (x: unknown) => JSON.stringify(x, null, 2) + "\n";
     await this.cropFigures();
-    await api.reproWrite(doi, "results_schema.json", json(st.schema));
-    await api.reproWrite(doi, "analysis_plan.json", json(st.plan));
+    const first = !st.packaged;
+    await api.reproWrite(doi, "results_schema.json", json(this.schema()));
+    await api.reproWrite(doi, "analysis_plan.json", json(this.plan()));
+    await api.reproWrite(doi, "inputs.json", json(inputsManifest(st)));
     await api.reproWrite(doi, "schemas/results_schema.schema.json", json(RESULTS_SCHEMA_JSON_SCHEMA));
     await api.reproWrite(doi, "schemas/analysis_plan.schema.json", json(PLAN_JSON_SCHEMA));
     await api.reproWrite(doi, "schemas/results_output.schema.json", json(RESULTS_OUTPUT_JSON_SCHEMA));
@@ -694,7 +764,8 @@ export class ReproView {
     await api.reproWrite(doi, "AGENT_PROMPT.md", this.prompt());
     await api.reproWrite(doi, "README.md", packageReadme(st.template, title, doi));
     await api.reproWrite(doi, "outputs/figures/.keep", "");
-    st.packaged = { template: st.template, at: new Date().toISOString() };
+    const git = await api.reproGit(doi, first ? "Create reproduction package" : "Update reproduction package");
+    st.packaged = { template: st.template, at: new Date().toISOString(), commit: git.committed ? git.head : st.packaged?.commit };
     st.command ||= TEMPLATES[st.template].command;
     this.save();
     await this.refreshFiles();
@@ -703,7 +774,7 @@ export class ReproView {
   /** Save crops of the original figures into targets/figures/<id>.png. */
   private async cropFigures() {
     const model = this.ctx.model();
-    const figs = this.state.schema?.results.filter((r) => r.type === "figure") ?? [];
+    const figs = this.schema()?.results.filter((r) => r.type === "figure") ?? [];
     if (!model || !figs.length || !this.ctx.pdf.loaded) return;
     const { blocks } = indexDoc(model);
     for (const r of figs) {
@@ -713,55 +784,71 @@ export class ReproView {
       if (!b.boxes?.length) page = (await this.ctx.pdf.findText(r.quote.slice(0, 120)))?.[0]?.page;
       const blob = await this.ctx.pdf.renderRegion(b.boxes, page);
       if (!blob) continue;
-      r.figure_file = `targets/figures/${r.id}.png`;
-      await api.reproWrite(this.doi, r.figure_file, new Uint8Array(await blob.arrayBuffer()));
+      const path = `targets/figures/${r.id}.png`;
+      await api.reproWrite(this.doi, path, new Uint8Array(await blob.arrayBuffer()));
+      this.state.figureFiles[r.id] = path;
     }
   }
 
   private prompt() {
-    return agentPrompt(this.state.template, { folder: this.folder, hasCode: this.filesIn("code").length > 0, dataFiles: this.filesIn("data") });
+    return agentPrompt(this.state.template, { folder: this.folder, inputs: this.state.inputs });
   }
 
-  // ---------- step 4: code generation ----------
+  // ---------- step 5: code generation ----------
 
   private renderCodegen(body: HTMLElement) {
     const st = this.state;
     const gen = this.running.has("codegen");
-    const prompt = `cd ${JSON.stringify(this.folder)}\n\n${this.prompt()}`;
     body.innerHTML = `
-    ${!st.packaged ? `<p class="warn">Create the package in step 3 first.</p>` : ""}
-    <div class="rp-cols">
-      <section class="rp-side rp-scroll">
-        <div class="rp-card">
-          <h3>Option A — headless Claude Code</h3>
-          <p>Runs <code>claude -p</code> inside the package folder with file edit permissions, using AGENT_PROMPT.md.</p>
-          <label><input type="checkbox" id="rp-exec" ${st.allowExec ? "checked" : ""}/> allow it to run R / Python / Snakemake to test the code</label>
-          <div class="actions">
-            <button id="rp-gen" class="primary" ${gen || !st.packaged ? "disabled" : ""}>${gen ? "Generating…" : "Generate code"}</button>
-            <button id="rp-gen-stop" ${gen ? "" : "disabled"}>Stop</button>
-          </div>
-          ${st.lastCodegen ? `<p class="muted">Last run: exit ${st.lastCodegen.code}, ${(st.lastCodegen.duration_ms / 1000).toFixed(0)} s, ${esc(new Date(st.lastCodegen.at).toLocaleString())}</p>` : ""}
-        </div>
-        <div class="rp-card">
-          <h3>Option B — your own agent</h3>
-          <p>Paste this into Claude Code (or another agent) in a terminal:</p>
-          <textarea readonly rows="12" class="mono" id="rp-prompt">${esc(prompt)}</textarea>
-          <div class="actions"><button id="rp-copy-prompt">Copy prompt</button><button id="rp-copy-path">Copy folder path</button></div>
-        </div>
-      </section>
-      <section class="rp-card rp-scroll">
-        <div class="rp-editor-head"><h3>Folder status</h3><span class="spacer"></span><button id="rp-refresh">↻ Refresh</button></div>
-        <div id="rp-gen-status"><p class="muted">Loading…</p></div>
-      </section>
+    <div class="rp-card">
+      <h3>Generate the code</h3>
+      ${!st.packaged ? `<p class="warn">Create the package in step 4 first.</p>` : ""}
+      <div class="rp-gen-row">
+        <div><b>Headless LLM agent</b><div class="hint">Runs without interaction in the package folder and implements the ${TODO_MARK} markers itself. Progress appears below; the result is committed to the package's git repository.</div></div>
+        <button id="rp-gen" class="primary" ${gen || !st.packaged ? "disabled" : ""}>${gen ? "Generating…" : "Run headless…"}</button>
+        <button id="rp-gen-stop" ${gen ? "" : "disabled"}>Stop</button>
+      </div>
+      <div class="rp-gen-row">
+        <div><b>Your own editor</b><div class="hint">Opens the package folder in your code editor (set in ⚙ Settings, otherwise the first one found). The suggested prompt tells an agent what to implement.</div></div>
+        <button id="rp-editor" ${st.packaged ? "" : "disabled"}>Open in external editor</button>
+        <button id="rp-copy-prompt" ${st.packaged ? "" : "disabled"}>Copy suggested prompt</button>
+      </div>
+      ${st.lastCodegen ? `<p class="muted">Last headless run: exit ${st.lastCodegen.code}, ${(st.lastCodegen.duration_ms / 1000).toFixed(0)} s, ${esc(new Date(st.lastCodegen.at).toLocaleString())}${st.lastCodegen.commit ? ` · <code>${esc(st.lastCodegen.commit)}</code>` : ""}</p>` : ""}
+    </div>
+    <div class="rp-card">
+      <div class="rp-editor-head"><h3>Folder status</h3><span class="spacer"></span><button id="rp-refresh">↻ Refresh</button></div>
+      <p id="rp-gen-summary" class="muted">Loading…</p>
+      <h4 id="rp-events-head" hidden>Agent activity</h4>
+      <ul id="rp-events" class="rp-events" hidden></ul>
+      <h4>Files (most recently modified first)</h4>
+      <div id="rp-gen-files"></div>
     </div>`;
-    body.querySelector("#rp-exec")!.addEventListener("change", (e) => {
-      st.allowExec = (e.target as HTMLInputElement).checked;
-      this.save();
-    });
     body.querySelector("#rp-gen")!.addEventListener("click", () => this.generate());
     body.querySelector("#rp-gen-stop")!.addEventListener("click", () => api.stopTask("codegen"));
-    body.querySelector("#rp-copy-prompt")!.addEventListener("click", () => navigator.clipboard.writeText(prompt).then(() => this.setStatus("Prompt copied")));
-    body.querySelector("#rp-copy-path")!.addEventListener("click", () => navigator.clipboard.writeText(this.folder).then(() => this.setStatus("Path copied")));
+    body.querySelector("#rp-editor")!.addEventListener("click", async () => {
+      try {
+        await api.reproWrite(this.doi, "AGENT_PROMPT.md", this.prompt());
+        const name = await api.openInEditor(this.doi);
+        this.setStatus(`Opened the package folder in ${name}`);
+      } catch (e) {
+        this.showError("Open in external editor", String(e));
+      }
+    });
+    const copyBtn = body.querySelector<HTMLButtonElement>("#rp-copy-prompt")!;
+    copyBtn.addEventListener("click", async () => {
+      const prompt = this.prompt();
+      try {
+        await navigator.clipboard.writeText(prompt);
+      } catch {
+        // Clipboard refused (e.g. no user activation): let the user copy it by hand.
+        const dlg = modal("rp-llm rp-agent", `<h3>Suggested prompt</h3><p class="hint">Copying to the clipboard failed; the prompt is selected below, press Ctrl+C.</p><textarea class="mono rp-prompt" readonly>${esc(prompt)}</textarea><form method="dialog"><menu><button class="primary">Close</button></menu></form>`);
+        dlg.querySelector("textarea")!.select();
+        return;
+      }
+      this.setStatus("Suggested prompt copied to the clipboard; paste it into the agent in your editor.");
+      copyBtn.textContent = "✓ Suggested prompt copied";
+      setTimeout(() => (copyBtn.textContent = "Copy suggested prompt"), 3000);
+    });
     body.querySelector("#rp-refresh")!.addEventListener("click", async () => {
       await this.refreshFiles();
       await this.updateCodegenStatus();
@@ -770,24 +857,28 @@ export class ReproView {
   }
 
   private async generate() {
-    await this.writePackageFilesOnly();
-    const r = await this.busy("codegen", "Generating code with Claude", () => api.claudeCodegen(this.doi, this.prompt(), this.state.allowExec));
-    if (r) this.state.lastCodegen = { code: r.code, duration_ms: r.duration_ms, at: new Date().toISOString() };
+    const st = this.state;
+    const prompt = this.prompt();
+    const choice = await agentDialog({ prompt, allowExec: st.allowExec, command: (m, exec) => api.llmCommand(this.doi, "codegen", { model: m, allowExec: exec }) });
+    if (!choice) return;
+    st.allowExec = choice.allowExec;
+    this.save();
+    await api.reproWrite(this.doi, "AGENT_PROMPT.md", prompt);
+    const r = await this.busy("codegen", "Generating code with the LLM agent", () => api.claudeCodegen(this.doi, prompt, choice.allowExec, { model: choice.model }));
+    if (r) {
+      const git = await api.reproGit(this.doi, `Code generated by the headless LLM agent (exit ${r.code})`).catch(() => undefined);
+      st.lastCodegen = { code: r.code, duration_ms: r.duration_ms, at: new Date().toISOString(), commit: git ? (git.committed ? git.head : "no changes to commit") : undefined };
+    }
     this.save();
     await this.refreshFiles();
-    if (this.state.step === 3) await this.updateCodegenStatus();
-  }
-
-  /** Refresh AGENT_PROMPT.md in case data/code changed since packaging. */
-  private async writePackageFilesOnly() {
-    await api.reproWrite(this.doi, "AGENT_PROMPT.md", this.prompt());
+    if (st.step === STEP.codegen) this.render();
   }
 
   private async updateCodegenStatus() {
-    const el = this.root.querySelector("#rp-gen-status");
-    if (!el) return;
+    const summary = this.root.querySelector("#rp-gen-summary");
+    if (!summary) return;
     const scriptPath = TEMPLATES[this.state.template].script;
-    let todo = "—";
+    let todo: string;
     try {
       const script = await api.reproReadText(this.doi, scriptPath);
       const n = (script.match(/TODO\(LLM\)/g) ?? []).length;
@@ -795,15 +886,37 @@ export class ReproView {
     } catch {
       todo = `<span class="warn-inline">${esc(scriptPath)} not found</span>`;
     }
-    const events = await this.codegenEvents();
+    summary.className = "";
+    summary.innerHTML = `<b>${esc(scriptPath)}</b>: ${todo}${this.running.has("codegen") ? ` · <span class="pulse">the agent is working…</span>` : ""}`;
+    this.appendEvents(await this.codegenEvents());
     const now = Date.now();
     const age = (t: number) => { const s = (now - t) / 1000; return s < 60 ? `${s.toFixed(0)} s ago` : s < 3600 ? `${(s / 60).toFixed(0)} min ago` : new Date(t).toLocaleString(); };
     const recent = [...this.files].sort((a, b) => b.modified - a.modified);
-    el.innerHTML = `
-      <p><b>${esc(scriptPath)}</b>: ${todo}${this.running.has("codegen") ? ` · <span class="pulse">Claude is working…</span>` : ""}</p>
-      ${events.length ? `<h4>Agent activity</h4><ul class="rp-events">${events.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>` : ""}
-      <h4>Files (most recently modified first)</h4>
-      <table class="rp-table"><tr><th>Path</th><th>Size</th><th>Modified</th></tr>${recent.map((f) => `<tr class="${now - f.modified < 60000 ? "fresh" : ""}"><td><code>${esc(f.path)}</code></td><td>${(f.size / 1024).toFixed(1)} KB</td><td>${age(f.modified)}</td></tr>`).join("")}</table>`;
+    this.root.querySelector("#rp-gen-files")!.innerHTML = `<table class="rp-table"><tr><th>Path</th><th>Size</th><th>Modified</th></tr>${recent.map((f) => `<tr class="${now - f.modified < 60000 ? "fresh" : ""}"><td><code>${esc(f.path)}</code></td><td>${(f.size / 1024).toFixed(1)} KB</td><td>${age(f.modified)}</td></tr>`).join("")}</table>`;
+  }
+
+  /**
+   * Append only new activity lines, so the list keeps its scroll position. It follows new messages while
+   * scrolled to the end; scrolled up, it stays where it is.
+   */
+  private appendEvents(events: string[]) {
+    const ul = this.root.querySelector<HTMLUListElement>("#rp-events");
+    if (!ul) return;
+    ul.hidden = !events.length;
+    this.root.querySelector<HTMLElement>("#rp-events-head")!.hidden = !events.length;
+    const atEnd = nearEnd(ul);
+    if (events.length < ul.children.length) ul.replaceChildren(); // a new run replaced the log
+    const fresh = ul.children.length === 0;
+    for (const text of events.slice(ul.children.length)) {
+      const li = document.createElement("li");
+      li.textContent = text;
+      ul.append(li);
+    }
+    if (fresh) {
+      const keep = this.eventsKeep;
+      this.eventsKeep = undefined;
+      ul.scrollTop = !keep || keep.atEnd ? ul.scrollHeight : keep.top;
+    } else if (atEnd) ul.scrollTop = ul.scrollHeight;
   }
 
   private async codegenEvents(): Promise<string[]> {
@@ -818,21 +931,21 @@ export class ReproView {
       if (!line.trim()) continue;
       try {
         const ev = JSON.parse(line);
-        if (ev.type === "system" && ev.subtype === "init") out.push(`▶ started (${ev.model ?? "claude"})`);
+        if (ev.type === "system" && ev.subtype === "init") out.push(`▶ started (${ev.model ?? "default model"})`);
         if (ev.type === "assistant")
           for (const c of ev.message?.content ?? []) {
             if (c.type === "tool_use") out.push(`🔧 ${c.name} ${c.input?.file_path ?? c.input?.command ?? c.input?.pattern ?? ""}`.trim());
-            if (c.type === "text" && c.text?.trim()) out.push(`💬 ${trunc(c.text.trim().replace(/\s+/g, " "), 200)}`);
+            if (c.type === "text" && c.text?.trim()) out.push(`💬 ${trunc(c.text.trim().replace(/\s+/g, " "), 300)}`);
           }
         if (ev.type === "result") out.push(`${ev.is_error ? "✗" : "✓"} finished: ${trunc(String(ev.result ?? "").replace(/\s+/g, " "), 300)}`);
       } catch {
         out.push(trunc(line, 200));
       }
     }
-    return out.slice(-25);
+    return out;
   }
 
-  // ---------- step 5: run & compare ----------
+  // ---------- step 6: run & compare ----------
 
   private renderRun(body: HTMLElement) {
     const st = this.state;
@@ -899,21 +1012,23 @@ export class ReproView {
     }
   }
 
+  /** Same scrolling rule as the agent activity: follow the end of the log unless scrolled up. */
   private async updateRunLog() {
     const el = this.root.querySelector("#rp-log");
     if (!el) return;
+    const atEnd = el.textContent === "…" || nearEnd(el);
     try {
       const lines = (await api.reproReadText(this.doi, "outputs/run.log")).split("\n");
       el.textContent = (lines.length > 300 ? `… (${lines.length - 300} earlier lines)\n` : "") + lines.slice(-300).join("\n");
-      el.scrollTop = el.scrollHeight;
+      if (atEnd) el.scrollTop = el.scrollHeight;
     } catch {
       el.textContent = "(no run yet)";
     }
   }
 
   private async loadOutput() {
-    const schema = this.state.schema;
-    if (!schema) return this.showError("Load results", "No results schema.");
+    const schema = this.schema();
+    if (!schema) return this.showError("Load results", "No targets.");
     try {
       const raw = JSON.parse(await api.reproReadText(this.doi, "outputs/results.json"));
       const v = validateOutput(raw, schema);
@@ -929,7 +1044,8 @@ export class ReproView {
 
   private recompare() {
     this.save();
-    if (this.state.schema && this.output) this.rows = compareAll(this.state.schema, this.output, this.state.compare);
+    const schema = this.schema();
+    if (schema && this.output) this.rows = compareAll(schema, this.output, this.state.compare);
     const el = this.root.querySelector("#rp-compare");
     if (el) {
       el.innerHTML = this.compareHtml();
@@ -970,7 +1086,7 @@ export class ReproView {
     }
   }
 
-  // ---------- step 6: report & zip ----------
+  // ---------- step 7: report & zip ----------
 
   private renderReport(body: HTMLElement) {
     const st = this.state;
@@ -1001,10 +1117,12 @@ export class ReproView {
 
   private async generateReport() {
     const st = this.state;
-    if (!st.schema || !st.plan) return this.showError("Report", "Results schema and analysis plan are required.");
+    const schema = this.schema();
+    const plan = this.plan();
+    if (!schema || !plan) return this.showError("Report", "Targets and an analysis plan are required.");
     await this.busy("report", "Generating report", async () => {
       if (!this.rows) await this.loadOutput();
-      const rows = this.rows ?? compareAll(st.schema!, undefined, st.compare);
+      const rows = this.rows ?? compareAll(schema, undefined, st.compare);
       await this.refreshFiles(true);
       const figures = new Map<string, { original?: string; reproduced?: string }>();
       for (const r of rows.filter((x) => x.target.type === "figure"))
@@ -1014,11 +1132,12 @@ export class ReproView {
         title: meta?.title ?? this.doi,
         doi: this.doi,
         authors: (meta?.authorships ?? []).map((a: any) => a.author?.display_name).join(", "),
-        schema: st.schema!,
-        plan: st.plan!,
+        schema,
+        plan,
         rows,
         settings: st.compare,
         files: this.files.filter((f) => f.path !== "report.html"),
+        inputs: st.inputs,
         template: st.template,
         command: st.command || TEMPLATES[st.template].command,
         run: st.lastRun,

@@ -124,8 +124,6 @@ dialog menu { display: flex; justify-content: flex-end; gap: 6px; padding: 0; ma
 .rp-card h4 { margin: 10px 0 4px; font-size: 13px; }
 .rp-side { display: flex; flex-direction: column; gap: 10px; }
 .rp-scroll { overflow: auto; }
-.rp-tree-card { display: flex; flex-direction: column; }
-.rp-tree-card #rp-tree { flex: 1; min-height: 0; }
 .muted { color: var(--muted); }
 .warn { color: #b3261e; background: #fdecea; padding: 6px 10px; border-radius: 5px; margin: 6px 0; }
 .warn-soft { color: #8a6d00; background: #fff8e1; padding: 6px 10px; border-radius: 5px; margin: 6px 0; }
@@ -144,9 +142,6 @@ code.path { background: #f1f1ec; padding: 1px 5px; border-radius: 3px; word-brea
 .sel-tree li li li label { font-size: 12.5px; color: #333; }
 .sel-floats li { padding: 2px 0; }
 
-.rp-files { list-style: none; padding: 0; margin: 0 0 6px; }
-.rp-files li { display: flex; gap: 6px; align-items: center; padding: 1px 0; }
-.rp-files button { padding: 0 6px; }
 
 .rp-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .rp-table th, .rp-table td { border: 1px solid var(--border); padding: 3px 5px; vertical-align: top; }
@@ -191,3 +186,48 @@ code.path { background: #f1f1ec; padding: 1px 5px; border-radius: 3px; word-brea
 .rp-figs img { max-width: 100%; border: 1px solid var(--border); background: #fff; }
 .rp-preview { flex: 1; min-height: 500px; border: 1px solid var(--border); border-radius: 8px; background: #fff; }
 dialog.rp-error { max-width: 800px; } dialog.rp-error pre { max-height: 400px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
+
+/* ---------- reproducibility: tables with LLM groups ---------- */
+button.danger { background: #b3261e; color: #fff; border-color: #b3261e; }
+button.danger-text { color: #b3261e; }
+.rp-items td:first-child, .rp-items th:first-child { width: 2.5em; text-align: center; }
+.rp-items .rp-id { white-space: nowrap; }
+.rp-row-actions button, .rp-group-head button, .rp-inputs button { padding: 0 6px; }
+.rp-group td { background: #eef3fb; }
+.rp-group-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.rp-twisty { border: 0; background: none; width: 1.6em; }
+.rp-items .rp-nested td:first-child { border-left: 3px solid #b9cbe8; }
+.rp-disabled td { color: var(--muted); background: #f3f3f0; }
+.rp-disabled td code, .rp-disabled .quote { text-decoration: line-through; }
+.rp-edited { background: #fff1cc; }
+.rp-fixed td { background: #f6f6f2; color: #444; }
+.rp-archive td { background: #f4f1ea; }
+.rp-inputs .rp-nested td:first-child { padding-left: 22px; border-left: 3px solid #d8cdb2; }
+.rp-inputs input[data-note] { width: 100%; min-width: 160px; }
+.rp-inputs th:nth-child(1) { width: 34%; } .rp-inputs th:nth-child(2) { width: 7em; } .rp-inputs th:nth-child(4) { width: 6em; } .rp-inputs th:nth-child(5) { width: 5.5em; }
+.rp-drop.over { outline: 2px dashed var(--accent); outline-offset: -4px; }
+.rp-gen-row { display: flex; gap: 8px; align-items: center; padding: 8px 0; border-top: 1px solid var(--border); }
+.rp-gen-row > div { flex: 1; }
+.rp-events { max-height: 320px; overflow: auto; }
+
+/* ---------- reproducibility: dialogs ---------- */
+dialog.rp-dialog { width: min(1100px, 94vw); max-height: 92vh; }
+dialog.rp-confirm { width: 480px; }
+dialog.rp-agent { width: min(820px, 94vw); }
+.rp-dialog h3 { margin: 0 0 6px; }
+.rp-dialog h4 { margin: 8px 0 4px; font-size: 13px; }
+.rp-dialog .sel-tree label, .rp-dialog .sel-floats label, .rp-dialog .rp-checks label { display: block; }
+.rp-dialog label.inline, .rp-dialog .actions label { flex-direction: row; }
+.rp-dialog menu { align-items: center; }
+.rp-dialog menu > .muted { flex: 1; }
+.rp-llm-grid, .rp-add-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; min-height: 0; }
+.rp-llm-grid > section, .rp-add-grid > section { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.rp-pick-tree { height: 52vh; overflow: auto; border: 1px solid var(--border); border-radius: 5px; padding: 4px 6px; }
+.rp-add .rp-pick-tree { height: 46vh; }
+.rp-pick .actions { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; margin-bottom: 4px; }
+.rp-call-meta { display: grid; grid-template-columns: max-content 1fr; gap: 3px 10px; font-size: 12.5px; align-items: baseline; }
+.rp-call-meta code { word-break: break-all; }
+textarea.rp-prompt { width: 100%; height: 30vh; resize: vertical; }
+.rp-llm-call textarea.rp-prompt { flex: 1; min-height: 180px; }
+.rp-checks { max-height: 120px; overflow: auto; border: 1px solid var(--border); border-radius: 5px; padding: 3px 6px; font-size: 12.5px; }
+.rp-add-row { display: flex; gap: 8px; flex-wrap: wrap; }
