@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "MetaReader as a Zotero 7–10 plugin",
+  "description": "Read papers as structured full text and build reproducibility packages in Zotero",
   "scripts": {
     "build": "scripts/build.sh",
     "typecheck": "tsc --noEmit -p ui && tsc --noEmit -p plugin",
